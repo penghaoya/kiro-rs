@@ -18,6 +18,7 @@ use axum::{
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
@@ -27,8 +28,9 @@ use crate::kiro::provider::KiroProvider;
 use crate::model::config::ToolCompatibilityMode;
 use crate::token;
 
-use super::cache_metering::CacheUsage;
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use super::cache_metering::CacheUsagePlan;
+use super::converter::{ConversionError, get_context_window_size};
+use super::handlers::{RequestTracer, convert_request_with_mode_blocking, last_attempt_outcome};
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::{SseEvent, THINKING_SIGNATURE_PLACEHOLDER, ToolJsonAccumulator};
 use super::types::{ErrorResponse, Message, MessagesRequest};
@@ -36,6 +38,81 @@ use super::websearch::{self, WebSearchResults};
 
 /// Maximum number of search rounds, to prevent an infinite loop if the upstream keeps asking to search
 const MAX_WEB_SEARCH_ROUNDS: usize = 5;
+
+type SseBytes = Result<Bytes, Infallible>;
+
+enum StreamStartup {
+    Started,
+    Failed(Response),
+}
+
+struct StreamFirstByteMarker {
+    tx: mpsc::Sender<SseBytes>,
+    startup_tx: Option<oneshot::Sender<StreamStartup>>,
+    started: bool,
+}
+
+impl StreamFirstByteMarker {
+    fn new(tx: mpsc::Sender<SseBytes>, startup_tx: oneshot::Sender<StreamStartup>) -> Self {
+        Self {
+            tx,
+            startup_tx: Some(startup_tx),
+            started: false,
+        }
+    }
+
+    async fn mark_first_upstream_chunk(&mut self) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        let _ = self.tx.send(Ok(create_ping_sse())).await;
+        if let Some(tx) = self.startup_tx.take() {
+            let _ = tx.send(StreamStartup::Started);
+        }
+    }
+
+    fn mark_started_before_final_flush(&mut self) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        if let Some(tx) = self.startup_tx.take() {
+            let _ = tx.send(StreamStartup::Started);
+        }
+    }
+
+    fn fail_before_start(&mut self, response: Response) -> bool {
+        if self.started {
+            return false;
+        }
+        self.started = true;
+        if let Some(tx) = self.startup_tx.take() {
+            let _ = tx.send(StreamStartup::Failed(response));
+        }
+        true
+    }
+}
+
+fn create_ping_sse() -> Bytes {
+    Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+}
+
+fn create_error_sse(error_type: &str, message: impl Into<String>) -> Bytes {
+    Bytes::from(
+        SseEvent::new(
+            "error",
+            json!({
+                "type": "error",
+                "error": {
+                    "type": error_type,
+                    "message": message.into(),
+                }
+            }),
+        )
+        .to_sse_string(),
+    )
+}
 
 /// Result of buffer-decoding one round of the upstream response
 struct RoundOutcome {
@@ -45,8 +122,6 @@ struct RoundOutcome {
     reasoning: String,
     /// Accumulated encrypted/redacted reasoning payloads from reasoningContentEvent
     redacted_reasoning: String,
-    /// Reasoning signature, if upstream supplied one
-    reasoning_signature: Option<String>,
     /// The complete tool_use for this round (name already restored via tool_name_map)
     tool_uses: Vec<DecodedToolUse>,
     /// Actual input tokens computed from contextUsageEvent
@@ -109,6 +184,7 @@ async fn decode_round(
     response: reqwest::Response,
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
+    mut first_byte_marker: Option<&mut StreamFirstByteMarker>,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
@@ -116,7 +192,6 @@ async fn decode_round(
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut redacted_reasoning = String::new();
-    let mut reasoning_signature: Option<String> = None;
     let mut tool_accumulator = ToolJsonAccumulator::new();
     let mut tool_uses: Vec<DecodedToolUse> = Vec::new();
     let mut context_input_tokens: Option<i32> = None;
@@ -134,6 +209,9 @@ async fn decode_round(
                 break;
             }
         };
+        if let Some(marker) = first_byte_marker.as_deref_mut() {
+            marker.mark_first_upstream_chunk().await;
+        }
         if let Err(e) = decoder.feed(&chunk) {
             tracing::warn!("buffer overflow: {}", e);
         }
@@ -157,9 +235,6 @@ async fn decode_round(
                         reasoning.push_str(&rc.text);
                     } else if let Some(redacted) = rc.redacted_content.as_ref() {
                         redacted_reasoning.push_str(redacted);
-                    }
-                    if let Some(signature) = rc.signature.as_ref().filter(|s| !s.is_empty()) {
-                        reasoning_signature = Some(signature.clone());
                     }
                 }
                 Event::ToolUse(tu) => match tool_accumulator.push(&tu, tool_name_map) {
@@ -201,7 +276,6 @@ async fn decode_round(
             text,
             reasoning,
             redacted_reasoning,
-            reasoning_signature,
             tool_uses,
             context_input_tokens,
             credits,
@@ -221,27 +295,39 @@ async fn run_round(
     hook: &UsageRecordHook,
     fallback_input_tokens: i32,
     tool_compatibility_mode: ToolCompatibilityMode,
+    first_byte_marker: Option<&mut StreamFirstByteMarker>,
+    tracer: &RequestTracer,
 ) -> Result<(RoundOutcome, u64), Response> {
-    let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
-        Ok(c) => c,
-        Err(e) => {
-            let (et, msg) = match &e {
-                ConversionError::UnsupportedModel(m) => {
-                    ("invalid_request_error", format!("unsupported model: {}", m))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "message list is empty".to_string())
-                }
-                ConversionError::UnsupportedToolMapping(message) => {
-                    ("unsupported_tool_mapping", message.clone())
-                }
-            };
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return Err(
-                (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response()
-            );
-        }
-    };
+    let conversion =
+        match convert_request_with_mode_blocking(payload.clone(), tool_compatibility_mode).await {
+            Ok(c) => c,
+            Err(e) => {
+                let (et, msg) = match &e {
+                    ConversionError::UnsupportedModel(m) => {
+                        ("invalid_request_error", format!("unsupported model: {}", m))
+                    }
+                    ConversionError::EmptyMessages => {
+                        ("invalid_request_error", "message list is empty".to_string())
+                    }
+                    ConversionError::UnsupportedToolMapping(message) => {
+                        ("unsupported_tool_mapping", message.clone())
+                    }
+                    ConversionError::InvalidImage(message) => {
+                        ("invalid_request_error", message.clone())
+                    }
+                };
+                hook.record(0, 0, 0, 0, 0, 0.0, "error");
+                tracer.finalize(
+                    "error",
+                    Some(crate::admin::trace_db::outcome::BAD_REQUEST),
+                    Some(&msg),
+                    None,
+                );
+                return Err(
+                    (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(et, msg))).into_response()
+                );
+            }
+        };
 
     let kiro_request = KiroRequest {
         conversation_state: conversion.conversation_state,
@@ -252,6 +338,12 @@ async fn run_round(
         Ok(b) => b,
         Err(e) => {
             hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                Some(crate::admin::trace_db::outcome::UNKNOWN),
+                Some(&format!("failed to serialize request: {}", e)),
+                None,
+            );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -263,10 +355,16 @@ async fn run_round(
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None).await {
+    let call_result = match provider.call_api_stream(&request_body, Some(tracer)).await {
         Ok(r) => r,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "error",
+                last_attempt_outcome(tracer),
+                Some(&e.to_string()),
+                None,
+            );
             return Err(map_provider_error(e));
         }
     };
@@ -275,10 +373,12 @@ async fn run_round(
         call_result.response,
         &payload.model,
         &conversion.tool_name_map,
+        first_byte_marker,
     )
     .await;
     if let Some(message) = &outcome.tool_json_error {
         hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize("error", last_attempt_outcome(tracer), Some(message), None);
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -292,6 +392,12 @@ async fn run_round(
         // The upstream stream was cut off mid-round; the decoded content is partial,
         // so fail the round instead of feeding truncated text/tool_use back into the loop.
         hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "interrupted",
+            Some(crate::admin::trace_db::outcome::STREAM_INTERRUPTED),
+            Some("Upstream response stream ended unexpectedly during the web_search loop."),
+            None,
+        );
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse::new(
@@ -322,10 +428,7 @@ fn append_search_round(
         assistant_content.push(json!({
             "type": "thinking",
             "thinking": round.reasoning,
-            "signature": round
-                .reasoning_signature
-                .as_deref()
-                .unwrap_or(THINKING_SIGNATURE_PLACEHOLDER)
+            "signature": THINKING_SIGNATURE_PLACEHOLDER
         }));
     }
     if thinking_enabled && !round.redacted_reasoning.is_empty() {
@@ -398,17 +501,25 @@ fn build_result_block(results: &Option<WebSearchResults>) -> Vec<Value> {
     }
 }
 
-/// web_search loop entry point
-///
-/// `stream_client`: whether the client wants SSE (true) or a single JSON response (false).
-pub(super) async fn run_web_search_loop(
+struct WebSearchLoopSuccess {
+    model: String,
+    content: Vec<Value>,
+    stop_reason: String,
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
+}
+
+async fn run_web_search_loop_inner(
     provider: Arc<KiroProvider>,
     mut payload: MessagesRequest,
     hook: UsageRecordHook,
-    stream_client: bool,
     tool_compatibility_mode: ToolCompatibilityMode,
-    cache_usage: CacheUsage,
-) -> Response {
+    cache_plan: CacheUsagePlan,
+    mut first_byte_marker: Option<&mut StreamFirstByteMarker>,
+    tracer: std::sync::Arc<RequestTracer>,
+) -> Result<WebSearchLoopSuccess, Response> {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
         payload.system.clone(),
@@ -429,11 +540,13 @@ pub(super) async fn run_web_search_loop(
             &hook,
             fallback_input_tokens,
             tool_compatibility_mode,
+            first_byte_marker.as_deref_mut(),
+            tracer.as_ref(),
         )
         .await
         {
             Ok(v) => v,
-            Err(resp) => return resp,
+            Err(resp) => return Err(resp),
         };
         last_credential_id = credential_id;
         last_context_input = round.context_input_tokens.or(last_context_input);
@@ -458,7 +571,13 @@ pub(super) async fn run_web_search_loop(
                             total_credits,
                             "error",
                         );
-                        return map_provider_error(e);
+                        tracer.finalize(
+                            "error",
+                            last_attempt_outcome(&tracer),
+                            Some(&e.to_string()),
+                            None,
+                        );
+                        return Err(map_provider_error(e));
                     }
                 }
             }
@@ -482,7 +601,7 @@ pub(super) async fn run_web_search_loop(
         });
         let total_input = last_context_input.unwrap_or(fallback_input_tokens);
         let (final_input, cache_creation_tokens, cache_read_tokens) =
-            cache_usage.split_against_total(total_input);
+            cache_plan.split_against_total(total_input);
 
         // Final content: presentation blocks (per-round search) + final-round text + final-round tool_use (exec, etc., returned as-is)
         let mut content: Vec<Value> = presentation.clone();
@@ -490,10 +609,7 @@ pub(super) async fn run_web_search_loop(
             content.push(json!({
                 "type": "thinking",
                 "thinking": round.reasoning,
-                "signature": round
-                    .reasoning_signature
-                    .as_deref()
-                    .unwrap_or(THINKING_SIGNATURE_PLACEHOLDER)
+                "signature": THINKING_SIGNATURE_PLACEHOLDER
             }));
         }
         if thinking_enabled && !round.redacted_reasoning.is_empty() {
@@ -521,28 +637,24 @@ pub(super) async fn run_web_search_loop(
             total_credits,
             "success",
         );
+        cache_plan.commit_success();
+        tracer.set_usage(
+            final_input,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        );
+        tracer.finalize("success", None, None, None);
 
-        return if stream_client {
-            render_sse(
-                &payload.model,
-                content,
-                &stop_reason,
-                final_input,
-                output_tokens,
-                cache_creation_tokens,
-                cache_read_tokens,
-            )
-        } else {
-            render_json(
-                &payload.model,
-                content,
-                &stop_reason,
-                final_input,
-                output_tokens,
-                cache_creation_tokens,
-                cache_read_tokens,
-            )
-        };
+        return Ok(WebSearchLoopSuccess {
+            model: payload.model,
+            content,
+            stop_reason,
+            input_tokens: final_input,
+            output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        });
     }
 
     // Theoretically unreachable (the loop always returns)
@@ -555,14 +667,151 @@ pub(super) async fn run_web_search_loop(
         total_credits,
         "error",
     );
-    (
+    tracer.finalize(
+        "error",
+        Some(crate::admin::trace_db::outcome::UNKNOWN),
+        Some("web_search loop exited unexpectedly"),
+        None,
+    );
+    Err((
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse::new(
             "internal_error",
             "web_search loop exited unexpectedly",
         )),
     )
-        .into_response()
+        .into_response())
+}
+
+/// web_search loop entry point
+///
+/// `stream_client`: whether the client wants SSE (true) or a single JSON response (false).
+pub(super) async fn run_web_search_loop(
+    provider: Arc<KiroProvider>,
+    payload: MessagesRequest,
+    hook: UsageRecordHook,
+    stream_client: bool,
+    tool_compatibility_mode: ToolCompatibilityMode,
+    cache_plan: CacheUsagePlan,
+    tracer: std::sync::Arc<RequestTracer>,
+) -> Response {
+    if stream_client {
+        return render_deferred_sse(
+            provider,
+            payload,
+            hook,
+            tool_compatibility_mode,
+            cache_plan,
+            tracer,
+        )
+        .await;
+    }
+
+    match run_web_search_loop_inner(
+        provider,
+        payload,
+        hook,
+        tool_compatibility_mode,
+        cache_plan,
+        None,
+        tracer,
+    )
+    .await
+    {
+        Ok(success) => render_json(
+            &success.model,
+            success.content,
+            &success.stop_reason,
+            success.input_tokens,
+            success.output_tokens,
+            success.cache_creation_tokens,
+            success.cache_read_tokens,
+        ),
+        Err(resp) => resp,
+    }
+}
+
+async fn render_deferred_sse(
+    provider: Arc<KiroProvider>,
+    payload: MessagesRequest,
+    hook: UsageRecordHook,
+    tool_compatibility_mode: ToolCompatibilityMode,
+    cache_plan: CacheUsagePlan,
+    tracer: std::sync::Arc<RequestTracer>,
+) -> Response {
+    let (tx, rx) = mpsc::channel::<SseBytes>(32);
+    let (startup_tx, startup_rx) = oneshot::channel::<StreamStartup>();
+
+    tokio::spawn(async move {
+        let mut marker = StreamFirstByteMarker::new(tx.clone(), startup_tx);
+        let result = run_web_search_loop_inner(
+            provider,
+            payload,
+            hook,
+            tool_compatibility_mode,
+            cache_plan,
+            Some(&mut marker),
+            tracer,
+        )
+        .await;
+
+        match result {
+            Ok(success) => {
+                marker.mark_started_before_final_flush();
+                for event in build_sse_events(
+                    &success.model,
+                    success.content,
+                    &success.stop_reason,
+                    success.input_tokens,
+                    success.output_tokens,
+                    success.cache_creation_tokens,
+                    success.cache_read_tokens,
+                ) {
+                    if tx
+                        .send(Ok(Bytes::from(event.to_sse_string())))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            Err(resp) => {
+                if !marker.fail_before_start(resp) {
+                    let _ = tx
+                        .send(Ok(create_error_sse(
+                            "api_error",
+                            "web_search loop failed after the upstream stream had started",
+                        )))
+                        .await;
+                }
+            }
+        }
+    });
+
+    match startup_rx.await {
+        Ok(StreamStartup::Started) => {
+            let stream = stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|item| (item, rx))
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-cache")
+                .header(header::CONNECTION, "keep-alive")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+        Ok(StreamStartup::Failed(resp)) => resp,
+        Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "upstream_error",
+                "web_search loop ended before the response stream could start",
+            )),
+        )
+            .into_response(),
+    }
 }
 
 /// Single JSON response (non-streaming)
@@ -591,39 +840,6 @@ fn render_json(
         }
     });
     (StatusCode::OK, Json(body)).into_response()
-}
-
-/// SSE response (streaming): splits the final content into a sequence of Anthropic content_block events
-fn render_sse(
-    model: &str,
-    content: Vec<Value>,
-    stop_reason: &str,
-    input_tokens: i32,
-    output_tokens: i32,
-    cache_creation_tokens: i32,
-    cache_read_tokens: i32,
-) -> Response {
-    let events = build_sse_events(
-        model,
-        content,
-        stop_reason,
-        input_tokens,
-        output_tokens,
-        cache_creation_tokens,
-        cache_read_tokens,
-    );
-    let stream = stream::iter(
-        events
-            .into_iter()
-            .map(|e| Ok::<Bytes, Infallible>(Bytes::from(e.to_sse_string()))),
-    );
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
-        .unwrap()
 }
 
 /// Renders the final content array into a sequence of SSE events
@@ -667,11 +883,6 @@ fn build_sse_events(
         match btype {
             "thinking" => {
                 let thinking = block.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
-                let signature = block
-                    .get("signature")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(THINKING_SIGNATURE_PLACEHOLDER);
                 events.push(SseEvent::new(
                     "content_block_start",
                     json!({
@@ -692,7 +903,7 @@ fn build_sse_events(
                     "content_block_delta",
                     json!({
                         "type": "content_block_delta", "index": index,
-                        "delta": {"type": "signature_delta", "signature": signature}
+                        "delta": {"type": "signature_delta", "signature": THINKING_SIGNATURE_PLACEHOLDER}
                     }),
                 ));
                 events.push(SseEvent::new(
@@ -907,7 +1118,6 @@ mod tests {
                 text: String::new(),
                 reasoning: String::new(),
                 redacted_reasoning: String::new(),
-                reasoning_signature: None,
                 tool_uses: Vec::new(),
                 context_input_tokens: None,
                 credits: 0.0,

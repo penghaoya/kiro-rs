@@ -14,20 +14,31 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
+use hmac::{Hmac, Mac};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 /// 客户端 Key 前缀（区分上游 `ksk_`）
 pub const CLIENT_KEY_PREFIX: &str = "csk_";
+const KEY_HASH_SCHEME: &str = "hmac-sha256";
+const HASH_SECRET_ENV: &str = "KIRO_RS_CLIENT_KEY_HASH_SECRET";
 
 /// 单条客户端 Key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientKey {
     pub id: u64,
-    /// 明文 Key（中转站场景，校验需原值，不做 hash）
+    /// 明文 Key。仅创建响应中返回一次；持久化时跳过。
+    #[serde(default, skip_serializing)]
     pub key: String,
+    /// Key 的 SHA-256 哈希（hex）。旧明文文件加载时自动迁移。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_hash: String,
+    /// 展示用前缀，不能用于鉴权。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_prefix: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -61,12 +72,14 @@ pub struct ClientKey {
 pub struct ClientKeyManager {
     inner: RwLock<Inner>,
     path: Option<PathBuf>,
+    hash_secret: Vec<u8>,
 }
 
 struct Inner {
     entries: HashMap<u64, ClientKey>,
-    by_key: HashMap<String, u64>,
+    by_hash: HashMap<String, u64>,
     next_id: u64,
+    dirty_usage: bool,
 }
 
 impl ClientKeyManager {
@@ -74,10 +87,13 @@ impl ClientKeyManager {
         Self {
             inner: RwLock::new(Inner {
                 entries: HashMap::new(),
-                by_key: HashMap::new(),
+                by_hash: HashMap::new(),
                 next_id: 1,
+                dirty_usage: false,
             }),
             path: None,
+            hash_secret: hash_secret_from_env()
+                .unwrap_or_else(|| crate::security::secure_token_urlsafe(32).into_bytes()),
         }
     }
 
@@ -95,26 +111,54 @@ impl ClientKeyManager {
             Vec::new()
         };
 
-        let mut by_key = HashMap::with_capacity(entries.len());
+        let hash_secret = load_hash_secret_for_path(&path)?;
+        let mut by_hash = HashMap::with_capacity(entries.len());
         let mut by_id = HashMap::with_capacity(entries.len());
         let mut max_id = 0u64;
-        for ck in entries {
+        let mut needs_rewrite = false;
+        for mut ck in entries {
             max_id = max_id.max(ck.id);
-            by_key.insert(ck.key.clone(), ck.id);
+            if !ck.key.is_empty() {
+                ck.key_hash = hash_key_with_secret(&hash_secret, &ck.key);
+                needs_rewrite = true;
+            } else if is_legacy_sha256_hash(&ck.key_hash) {
+                tracing::warn!(
+                    key_id = ck.id,
+                    "client key entry has legacy unsalted hash and cannot be upgraded without plaintext; recreate this key"
+                );
+            }
+            if ck.key_prefix.is_empty() && !ck.key.is_empty() {
+                ck.key_prefix = key_prefix(&ck.key);
+                needs_rewrite = true;
+            }
+            if !ck.key.is_empty() {
+                needs_rewrite = true;
+            }
+            ck.key.clear();
+            if !ck.key_hash.is_empty() {
+                by_hash.insert(ck.key_hash.clone(), ck.id);
+            }
             by_id.insert(ck.id, ck);
         }
 
-        Ok(Self {
+        let manager = Self {
             inner: RwLock::new(Inner {
                 entries: by_id,
-                by_key,
+                by_hash,
                 next_id: max_id + 1,
+                dirty_usage: false,
             }),
             path: Some(path),
-        })
+            hash_secret,
+        };
+        if needs_rewrite {
+            let mut inner = manager.inner.write();
+            manager.save_locked(&mut inner);
+        }
+        Ok(manager)
     }
 
-    fn save_locked(&self, inner: &Inner) {
+    fn save_locked(&self, inner: &mut Inner) {
         let path = match &self.path {
             Some(p) => p,
             None => return,
@@ -123,9 +167,10 @@ impl ClientKeyManager {
         list.sort_by_key(|k| k.id);
         match serde_json::to_string_pretty(&list) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                if let Err(e) = atomic_write(path, json.as_bytes()) {
                     tracing::warn!("写入客户端 Key 文件失败: {}", e);
                 }
+                inner.dirty_usage = false;
             }
             Err(e) => tracing::warn!("序列化客户端 Key 失败: {}", e),
         }
@@ -148,6 +193,8 @@ impl ClientKeyManager {
         let entry = ClientKey {
             id,
             key: key.clone(),
+            key_hash: self.hash_key(&key),
+            key_prefix: key_prefix(&key),
             name,
             description,
             disabled: false,
@@ -160,9 +207,9 @@ impl ClientKeyManager {
             total_cache_read_tokens: 0,
             total_credits: 0.0,
         };
-        inner.by_key.insert(key, id);
+        inner.by_hash.insert(entry.key_hash.clone(), id);
         inner.entries.insert(id, entry.clone());
-        self.save_locked(&inner);
+        self.save_locked(&mut inner);
         entry
     }
 
@@ -170,13 +217,13 @@ impl ClientKeyManager {
         let mut inner = self.inner.write();
         let removed = match inner.entries.remove(&id) {
             Some(e) => {
-                inner.by_key.remove(&e.key);
+                inner.by_hash.remove(&e.key_hash);
                 true
             }
             None => false,
         };
         if removed {
-            self.save_locked(&inner);
+            self.save_locked(&mut inner);
         }
         removed
     }
@@ -191,7 +238,7 @@ impl ClientKeyManager {
             None => false,
         };
         if updated {
-            self.save_locked(&inner);
+            self.save_locked(&mut inner);
         }
         updated
     }
@@ -216,7 +263,7 @@ impl ClientKeyManager {
             None => false,
         };
         if updated {
-            self.save_locked(&inner);
+            self.save_locked(&mut inner);
         }
         updated
     }
@@ -237,7 +284,7 @@ impl ClientKeyManager {
             None => false,
         };
         if updated {
-            self.save_locked(&inner);
+            self.save_locked(&mut inner);
         }
         updated
     }
@@ -253,25 +300,45 @@ impl ClientKeyManager {
         let mut inner = self.inner.write();
         // 第一遍：扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
         let mut hit_id: Option<u64> = None;
+        let presented_hash = self.hash_key(presented);
+        let legacy_hash = legacy_sha256_hash(presented);
+        let mut legacy_hit_hash: Option<String> = None;
         for (id, ck) in inner.entries.iter() {
             if ck.disabled {
                 continue;
             }
-            if ck.key.as_bytes().ct_eq(presented.as_bytes()).into() {
+            if ck
+                .key_hash
+                .as_bytes()
+                .ct_eq(presented_hash.as_bytes())
+                .into()
+                || ck.key_hash.as_bytes().ct_eq(legacy_hash.as_bytes()).into()
+            {
                 hit_id = Some(*id);
+                if ck.key_hash == legacy_hash {
+                    legacy_hit_hash = Some(ck.key_hash.clone());
+                }
                 // 不 break，继续完整扫描以保持常量时间
             }
         }
         let id = hit_id?;
         if let Some(entry) = inner.entries.get_mut(&id) {
+            if legacy_hit_hash.is_some() {
+                entry.key_hash = presented_hash.clone();
+            }
             entry.total_calls += 1;
             entry.last_used_at = Some(Utc::now().to_rfc3339());
+        }
+        if let Some(old_hash) = legacy_hit_hash {
+            inner.by_hash.remove(&old_hash);
+            inner.by_hash.insert(presented_hash, id);
+            self.save_locked(&mut inner);
         }
         // 不在每次请求都落盘（高频写入），由 record_usage / 定期 flush 持久化
         Some(id)
     }
 
-    /// 在请求结束时累计 Token 用量并落盘
+    /// 在请求结束时累计 Token 用量；文件持久化由后台 flush 批量完成。
     pub fn record_usage(
         &self,
         id: u64,
@@ -292,7 +359,7 @@ impl ClientKeyManager {
             }
             entry.last_used_at = Some(Utc::now().to_rfc3339());
         }
-        self.save_locked(&inner);
+        inner.dirty_usage = true;
     }
 
     /// 获取统计后的 active Key 数（未禁用）
@@ -304,6 +371,27 @@ impl ClientKeyManager {
             .filter(|e| !e.disabled)
             .count()
     }
+
+    pub fn flush_to_disk(&self) {
+        let mut inner = self.inner.write();
+        if !inner.dirty_usage {
+            return;
+        }
+        self.save_locked(&mut inner);
+    }
+
+    pub fn spawn_background_flush(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                self.flush_to_disk();
+            }
+        });
+    }
+
+    fn hash_key(&self, key: &str) -> String {
+        hash_key_with_secret(&self.hash_secret, key)
+    }
 }
 
 impl Default for ClientKeyManager {
@@ -314,22 +402,96 @@ impl Default for ClientKeyManager {
 
 /// 生成 `csk_` 前缀 + 32 位 base62 随机字符串
 pub fn generate_client_key() -> String {
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let body: String = (0..32)
-        .map(|_| {
-            let idx = fastrand::usize(..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect();
+    let body = crate::security::secure_token_urlsafe(32);
     format!("{}{}", CLIENT_KEY_PREFIX, body)
+}
+
+fn hash_key_with_secret(secret: &[u8], key: &str) -> String {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret).expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(key.as_bytes());
+    format!(
+        "{}:{}",
+        KEY_HASH_SCHEME,
+        hex::encode(mac.finalize().into_bytes())
+    )
+}
+
+fn legacy_sha256_hash(key: &str) -> String {
+    hex::encode(Sha256::digest(key.as_bytes()))
+}
+
+fn hash_secret_from_env() -> Option<Vec<u8>> {
+    let value = std::env::var(HASH_SECRET_ENV).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.as_bytes().to_vec())
+    }
+}
+
+fn load_hash_secret_for_path(path: &Path) -> anyhow::Result<Vec<u8>> {
+    if let Some(secret) = hash_secret_from_env() {
+        return Ok(secret);
+    }
+    let secret_path = hash_secret_path(path);
+    if secret_path.exists() {
+        let secret = std::fs::read_to_string(&secret_path)?;
+        let trimmed = secret.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.as_bytes().to_vec());
+        }
+    }
+    let secret = crate::security::secure_token_urlsafe(32);
+    atomic_write(&secret_path, secret.as_bytes())?;
+    Ok(secret.into_bytes())
+}
+
+fn hash_secret_path(path: &Path) -> PathBuf {
+    path.with_extension("secret")
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!(
+        "tmp-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(windows)]
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&tmp, path)
+}
+
+fn is_legacy_sha256_hash(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn key_prefix(key: &str) -> String {
+    key.chars().take(8).collect()
 }
 
 /// 脱敏展示：保留前 8 位（含前缀）和后 4 位
 pub fn mask_client_key(key: &str) -> String {
+    if key.is_empty() {
+        return String::new();
+    }
     if key.len() <= 12 {
         return key.to_string();
     }
     format!("{}...{}", &key[..8], &key[key.len() - 4..])
+}
+
+pub fn display_client_key(record: &ClientKey) -> String {
+    if !record.key.is_empty() {
+        return mask_client_key(&record.key);
+    }
+    if !record.key_prefix.is_empty() && record.key_hash.len() >= 12 {
+        return format!("{}...{}", record.key_prefix, &record.key_hash[..12]);
+    }
+    String::new()
 }
 
 /// 默认管理器路径（相对凭据目录）
@@ -382,5 +544,86 @@ mod tests {
     fn mask_format() {
         assert_eq!(mask_client_key("csk_abcdefghijklmnop"), "csk_abcd...mnop");
         assert_eq!(mask_client_key("short"), "short");
+    }
+
+    #[test]
+    fn client_keys_file_does_not_contain_plaintext_key() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-client-keys-{}.json",
+            crate::security::secure_token_urlsafe(8)
+        ));
+        let mgr = ClientKeyManager::load(&path).unwrap();
+        let entry = mgr.create("test".to_string(), None);
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !persisted.contains(&entry.key),
+            "client key persistence must not contain the plaintext key"
+        );
+        assert!(persisted.contains("keyHash"));
+        assert!(persisted.contains(KEY_HASH_SCHEME));
+        assert!(hash_secret_path(&path).exists());
+        let loaded = ClientKeyManager::load(&path).unwrap();
+        assert_eq!(loaded.verify_and_touch(&entry.key), Some(entry.id));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(hash_secret_path(&path));
+    }
+
+    #[test]
+    fn legacy_plaintext_client_key_is_scrubbed_on_load() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-client-keys-legacy-{}.json",
+            crate::security::secure_token_urlsafe(8)
+        ));
+        let plaintext = "csk_legacy_plaintext_key_1234567890";
+        std::fs::write(
+            &path,
+            format!(
+                r#"[{{
+                    "id": 1,
+                    "key": "{plaintext}",
+                    "name": "legacy",
+                    "createdAt": "2026-01-01T00:00:00Z"
+                }}]"#
+            ),
+        )
+        .unwrap();
+        let loaded = ClientKeyManager::load(&path).unwrap();
+        assert_eq!(loaded.verify_and_touch(plaintext), Some(1));
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains(plaintext));
+        assert!(!persisted.contains(r#""key""#));
+        assert!(persisted.contains(KEY_HASH_SCHEME));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(hash_secret_path(&path));
+    }
+
+    #[test]
+    fn legacy_sha256_client_key_upgrades_after_successful_verify() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-client-keys-sha-{}.json",
+            crate::security::secure_token_urlsafe(8)
+        ));
+        let plaintext = "csk_legacy_sha256_key_1234567890";
+        let legacy_hash = legacy_sha256_hash(plaintext);
+        std::fs::write(
+            &path,
+            format!(
+                r#"[{{
+                    "id": 1,
+                    "keyHash": "{legacy_hash}",
+                    "keyPrefix": "csk_lega",
+                    "name": "legacy",
+                    "createdAt": "2026-01-01T00:00:00Z"
+                }}]"#
+            ),
+        )
+        .unwrap();
+        let loaded = ClientKeyManager::load(&path).unwrap();
+        assert_eq!(loaded.verify_and_touch(plaintext), Some(1));
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains(&legacy_hash));
+        assert!(persisted.contains(KEY_HASH_SCHEME));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(hash_secret_path(&path));
     }
 }

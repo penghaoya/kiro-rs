@@ -173,10 +173,26 @@ pub async fn auth_middleware(
 /// - `allow_methods(Any)`: 允许任何 HTTP 方法
 /// - `allow_headers(Any)`: 允许任何请求头
 pub fn cors_layer() -> tower_http::cors::CorsLayer {
-    use tower_http::cors::{Any, CorsLayer};
+    use axum::http::{HeaderValue, Method};
+    use tower_http::cors::CorsLayer;
 
     CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
+        .allow_origin([
+            HeaderValue::from_static("http://localhost:8990"),
+            HeaderValue::from_static("http://127.0.0.1:8990"),
+            HeaderValue::from_static("http://localhost:8080"),
+            HeaderValue::from_static("http://127.0.0.1:8080"),
+        ])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderName::from_static("x-api-key"),
+        ])
 }

@@ -2461,8 +2461,13 @@ impl MultiTokenManager {
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
-        let usage_limits =
-            get_usage_limits(&credentials, &self.config(), &token, effective_proxy.as_ref()).await?;
+        let usage_limits = get_usage_limits(
+            &credentials,
+            &self.config(),
+            &token,
+            effective_proxy.as_ref(),
+        )
+        .await?;
 
         // 更新订阅等级到凭据（仅在发生变化时持久化）
         if let Some(subscription_title) = usage_limits.subscription_title() {
@@ -2610,7 +2615,13 @@ impl MultiTokenManager {
         let (token, credentials) = self.prepare_request_token(id).await?;
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
-        get_available_models(&credentials, &self.config(), &token, effective_proxy.as_ref()).await
+        get_available_models(
+            &credentials,
+            &self.config(),
+            &token,
+            effective_proxy.as_ref(),
+        )
+        .await
     }
 
     /// 设置用户偏好（开启/关闭超额）— Admin API
@@ -3078,7 +3089,8 @@ impl MultiTokenManager {
         // 无条件调用 refresh_token
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
-        let new_creds = refresh_token(&credentials, &self.config(), effective_proxy.as_ref()).await?;
+        let new_creds =
+            refresh_token(&credentials, &self.config(), effective_proxy.as_ref()).await?;
 
         // 更新 entries 中对应凭据
         {

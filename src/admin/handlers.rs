@@ -7,7 +7,7 @@ use axum::{
 };
 
 use super::{
-    client_keys::mask_client_key,
+    client_keys::display_client_key,
     middleware::AdminState,
     trace_db::TraceQuery,
     types::{
@@ -15,9 +15,8 @@ use super::{
         BatchAddProxyRequest, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
         CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetEndpointRequest,
-        SetGlobalProxyRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+        SetPriorityRequest, SetRetryPolicyRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
         StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest, UpdateClientKeyRequest,
         UpdateCredentialRequest, UpdateGlobalConfigRequest, UpdateRefreshTokenRequest,
     },
@@ -798,7 +797,7 @@ pub async fn update_api_key(
 fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
     ClientKeyItem {
         id: k.id,
-        masked_key: mask_client_key(&k.key),
+        masked_key: display_client_key(k),
         name: k.name.clone(),
         description: k.description.clone(),
         disabled: k.disabled,

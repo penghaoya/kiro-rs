@@ -255,14 +255,7 @@ fn base64_encode_standard(data: &[u8]) -> String {
 pub fn generate_pkce() -> (String, String) {
     // 32 字节随机数作为 verifier（与 IDE crypto.randomBytes(32).toString("base64url") 等价）
     let mut bytes = [0u8; 32];
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b = fastrand::u8(..).wrapping_add(i as u8);
-    }
-    // 使用 uuid v4 的随机性来增强
-    let uuid_bytes = uuid::Uuid::new_v4().as_bytes().to_owned();
-    for (i, b) in bytes.iter_mut().enumerate() {
-        *b ^= uuid_bytes[i % 16];
-    }
+    getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable for PKCE verifier");
 
     let verifier = base64url_encode(&bytes);
 

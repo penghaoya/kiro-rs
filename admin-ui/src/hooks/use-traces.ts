@@ -5,7 +5,8 @@ import type { TraceQuery } from '@/types/api'
 /**
  * 请求链路查询 hook
  *
- * 复用与 stats 一致的刷新策略：30s 自动刷新、切换筛选时保留旧数据避免闪烁。
+ * 请求日志用于排障，刷新要比仪表盘更积极：进入页面、窗口重新聚焦、
+ * 网络恢复时都重新拉取，并保持短轮询，避免新请求看起来“不更新”。
  * `enabled=false` 时不发请求（用于弹框未打开时的懒加载）。
  */
 export function useTraces(query: TraceQuery, enabled = true) {
@@ -13,10 +14,12 @@ export function useTraces(query: TraceQuery, enabled = true) {
     queryKey: ['traces', query],
     queryFn: () => getTraces(query),
     enabled,
-    refetchInterval: enabled ? 30_000 : false,
-    staleTime: 10_000,
+    refetchInterval: enabled ? 5_000 : false,
+    staleTime: 1_000,
     placeholderData: keepPreviousData,
-    refetchOnWindowFocus: false,
+    refetchOnMount: 'always',
+    refetchOnReconnect: true,
+    refetchOnWindowFocus: true,
   })
 }
 

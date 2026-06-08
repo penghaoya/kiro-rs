@@ -1,3 +1,27 @@
+#![allow(
+    clippy::byte_char_slices,
+    clippy::collapsible_if,
+    clippy::derivable_impls,
+    clippy::drop_non_drop,
+    clippy::field_reassign_with_default,
+    clippy::large_enum_variant,
+    clippy::let_and_return,
+    clippy::manual_div_ceil,
+    clippy::manual_pattern_char_comparison,
+    clippy::manual_range_contains,
+    clippy::needless_borrow,
+    clippy::needless_range_loop,
+    clippy::needless_return,
+    clippy::nonminimal_bool,
+    clippy::ptr_arg,
+    clippy::redundant_field_names,
+    clippy::result_large_err,
+    clippy::to_string_in_format_args,
+    clippy::too_many_arguments,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_lazy_evaluations
+)]
+
 mod admin;
 mod admin_ui;
 mod anthropic;
@@ -6,6 +30,7 @@ mod http_client;
 mod image_resize;
 mod kiro;
 mod model;
+mod security;
 pub mod token;
 
 use std::collections::HashMap;
@@ -106,7 +131,10 @@ async fn main() {
     });
 
     if proxy_config.is_some() {
-        tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
+        tracing::info!(
+            "已配置 HTTP 代理: {}",
+            crate::security::redact_proxy_url(config.proxy_url.as_ref().unwrap())
+        );
     }
 
     kiro::kiro_version::spawn_refresher(
@@ -190,6 +218,7 @@ async fn main() {
             admin::ClientKeyManager::new()
         }),
     );
+    client_key_manager.clone().spawn_background_flush();
     let usage_recorder = std::sync::Arc::new(admin::UsageRecorder::with_retention(
         cache_dir.clone(),
         config.usage_log_retention_days as i64,
@@ -317,7 +346,10 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
+    tracing::info!(
+        "API Key fingerprint: {}",
+        crate::security::key_fingerprint(&api_key)
+    );
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
@@ -340,7 +372,7 @@ async fn main() {
 /// 文件不存在时初始化配置/凭证文件
 ///
 /// - `config.json`：写入带随机 `apiKey` / `adminApiKey` 的最小默认配置，
-///   `host` 设为 `0.0.0.0` 以适配容器场景，端口/默认端点等其余字段沿用代码默认值。
+///   `host` 设为 `127.0.0.1`，避免首次启动时把 Admin/API 面暴露到公网。
 /// - `credentials.json`：写入空数组 `[]`，便于后续通过 Admin UI 添加凭据。
 ///
 /// 任一步失败都仅打印警告，不中断启动；后续 `Config::load` / `CredentialsConfig::load`
@@ -355,10 +387,10 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
                 }
             }
         }
-        let api_key = format!("sk-kiro-rs-{}", random_token(24));
-        let admin_api_key = format!("sk-admin-{}", random_token(24));
+        let api_key = format!("sk-kiro-rs-{}", random_token(32));
+        let admin_api_key = format!("sk-admin-{}", random_token(32));
         let default = serde_json::json!({
-            "host": "0.0.0.0",
+            "host": "127.0.0.1",
             "port": 8990,
             "apiKey": api_key,
             "adminApiKey": admin_api_key,
@@ -373,9 +405,15 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         {
             Ok(_) => {
                 tracing::info!("已生成默认配置: {}", config_p.display());
-                tracing::info!("  apiKey      = {}", api_key);
-                tracing::info!("  adminApiKey = {}", admin_api_key);
-                tracing::info!("请妥善保存上述密钥，可在配置文件中修改");
+                tracing::info!(
+                    "  apiKey fingerprint      = {}",
+                    crate::security::key_fingerprint(&api_key)
+                );
+                tracing::info!(
+                    "  adminApiKey fingerprint = {}",
+                    crate::security::key_fingerprint(&admin_api_key)
+                );
+                tracing::info!("完整密钥已写入配置文件，请通过配置文件查看和保管");
             }
             Err(e) => tracing::warn!("写入默认配置失败 {}: {}", config_p.display(), e),
         }
@@ -403,11 +441,5 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
 
 /// 生成一段长度为 `len` 的字母数字随机字符串，用于默认 API Key
 fn random_token(len: usize) -> String {
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    (0..len)
-        .map(|_| {
-            let idx = fastrand::usize(..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect()
+    crate::security::secure_token_urlsafe(len)
 }

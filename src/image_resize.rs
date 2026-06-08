@@ -31,6 +31,16 @@ const DEFAULT_MAX_LONG_SIDE: u32 = 1568;
 const DEFAULT_MAX_BYTES: usize = 400_000;
 /// Default JPEG quality
 const DEFAULT_JPEG_QUALITY: u8 = 85;
+/// Default per-image base64 hard limit. This is a security cap, not the resize target.
+const DEFAULT_MAX_BASE64_BYTES: usize = 8 * 1024 * 1024;
+/// Default per-image decoded-byte hard limit.
+const DEFAULT_MAX_DECODED_BYTES: usize = 6 * 1024 * 1024;
+/// Default decoded pixel hard limit, matching the review recommendation.
+const DEFAULT_MAX_PIXELS: u64 = 40_000_000;
+/// Default per-request image count hard limit.
+const DEFAULT_MAX_IMAGES_PER_REQUEST: usize = 32;
+/// Default per-request inline image base64 hard limit.
+const DEFAULT_MAX_TOTAL_BASE64_BYTES: usize = 24 * 1024 * 1024;
 
 /// Inbound image processor configuration
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +49,9 @@ pub struct ResizeConfig {
     pub max_long_side: u32,
     pub max_bytes: usize,
     pub jpeg_quality: u8,
+    pub max_base64_bytes: usize,
+    pub max_decoded_bytes: usize,
+    pub max_pixels: u64,
 }
 
 impl ResizeConfig {
@@ -63,12 +76,65 @@ impl ResizeConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_JPEG_QUALITY);
+        let max_base64_bytes = std::env::var("KIRO_RS_IMAGE_MAX_BASE64_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_BASE64_BYTES);
+        let max_decoded_bytes = std::env::var("KIRO_RS_IMAGE_MAX_DECODED_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_DECODED_BYTES);
+        let max_pixels = std::env::var("KIRO_RS_IMAGE_MAX_PIXELS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MAX_PIXELS);
         Self {
             enabled,
             max_long_side,
             max_bytes,
             jpeg_quality,
+            max_base64_bytes,
+            max_decoded_bytes,
+            max_pixels,
         }
+    }
+}
+
+/// Per-request inline image budget.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestImageLimits {
+    pub max_count: usize,
+    pub max_total_base64_bytes: usize,
+}
+
+impl RequestImageLimits {
+    pub fn from_env() -> Self {
+        Self {
+            max_count: std::env::var("KIRO_RS_IMAGE_MAX_COUNT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_MAX_IMAGES_PER_REQUEST),
+            max_total_base64_bytes: std::env::var("KIRO_RS_IMAGE_MAX_TOTAL_BASE64_BYTES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_MAX_TOTAL_BASE64_BYTES),
+        }
+    }
+
+    pub fn validate(self, count: usize, total_base64_bytes: usize) -> Result<(), ResizeError> {
+        if count > self.max_count {
+            return Err(ResizeError::LimitExceeded(format!(
+                "too many inline images: {} > {}",
+                count, self.max_count
+            )));
+        }
+        if total_base64_bytes > self.max_total_base64_bytes {
+            return Err(ResizeError::LimitExceeded(format!(
+                "inline image payload too large: {} > {} base64 bytes",
+                total_base64_bytes, self.max_total_base64_bytes
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -96,48 +162,71 @@ pub struct ProcessedImage {
 /// `format` is the last segment of the source media-type ("png" / "jpeg" / "gif" / "webp"),
 /// `data_base64` is the base64-encoded raw bytes.
 ///
-/// Never panics and never drops an image. On failure it returns an owned copy of the input and logs a warning.
-pub fn maybe_shrink_image(cfg: ResizeConfig, format: &str, data_base64: &str) -> ProcessedImage {
+/// Never panics. Hard-limit failures return an error so callers can reject unsafe payloads
+/// instead of passing huge or failed-decode images through unchecked.
+pub fn maybe_shrink_image(
+    cfg: ResizeConfig,
+    format: &str,
+    data_base64: &str,
+) -> Result<ProcessedImage, ResizeError> {
     let format_lc = format.to_ascii_lowercase();
     let original_bytes = data_base64.len();
+    validate_base64_limits(cfg, data_base64)?;
 
     // 1) Disabled: return as-is
     if !cfg.enabled {
-        return passthrough(format_lc, data_base64);
+        validate_passthrough_safe(cfg, &format_lc, data_base64)?;
+        return Ok(passthrough(format_lc, data_base64));
     }
     // 2) Bytes small enough: return as-is (small images need no work, saves CPU)
     if data_base64.len() <= cfg.max_bytes {
         // Even with small bytes, check whether the dimensions are oversized (rare, e.g. a 7000x100 banner)
         // Use a lightweight probe (header only): image::ImageReader::with_guessed_format
-        if let Some((w, h)) = peek_dimensions(&format_lc, data_base64)
-            && w.max(h) <= cfg.max_long_side
-        {
-            return passthrough(format_lc, data_base64);
+        match peek_dimensions_checked(cfg, &format_lc, data_base64) {
+            Ok(Some((w, h))) if w.max(h) <= cfg.max_long_side => {
+                return Ok(passthrough(format_lc, data_base64));
+            }
+            Ok(Some(_)) => {
+                // Small bytes but oversized dimensions: still take the re-encode path
+            }
+            Ok(None) => {
+                // Small opaque/corrupt inputs are left to upstream MIME validation; the hard-size
+                // path below refuses oversized failed-decode payloads.
+                return Ok(passthrough(format_lc, data_base64));
+            }
+            Err(e) => return Err(e),
         }
-        // Small bytes but oversized dimensions: still take the re-encode path
     }
     // 3) Animated images (multi-frame GIF) keep their original format unchanged - JPEG would lose the animation
     if format_lc == "gif" {
+        validate_passthrough_safe(cfg, &format_lc, data_base64)?;
+        if data_base64.len() > cfg.max_bytes {
+            return Err(ResizeError::LimitExceeded(format!(
+                "gif image too large for passthrough: {} > {} base64 bytes",
+                data_base64.len(),
+                cfg.max_bytes
+            )));
+        }
         debug!(
             target: "kiro_rs::image_resize",
             original_bytes = original_bytes,
             "skip GIF (potential animation)"
         );
-        return passthrough(format_lc, data_base64);
+        return Ok(passthrough(format_lc, data_base64));
     }
 
     // 4) Actually shrink the image
     match shrink_static_image(cfg, &format_lc, data_base64) {
-        Ok(processed) => processed,
+        Ok(processed) => Ok(processed),
         Err(e) => {
             warn!(
                 target: "kiro_rs::image_resize",
                 error = %e,
                 format = %format_lc,
                 original_bytes = original_bytes,
-                "image resize failed; passing through original"
+                "image resize failed"
             );
-            passthrough(format_lc, data_base64)
+            Err(e)
         }
     }
 }
@@ -182,17 +271,67 @@ fn detect_format_from_bytes(data_base64: &str) -> Option<String> {
     }
 }
 
-/// Reads only the header for dimensions without decoding all pixels; < 1ms per image
-fn peek_dimensions(format: &str, data_base64: &str) -> Option<(u32, u32)> {
-    let bytes = BASE64.decode(data_base64).ok()?;
-    let cursor = Cursor::new(&bytes);
+/// Reads the encoded bytes and asks the image reader for dimensions without decoding pixels.
+fn peek_dimensions_checked(
+    cfg: ResizeConfig,
+    format: &str,
+    data_base64: &str,
+) -> Result<Option<(u32, u32)>, ResizeError> {
+    validate_base64_limits(cfg, data_base64)?;
+    let bytes = BASE64
+        .decode(data_base64)
+        .map_err(|e| ResizeError::Base64(e.to_string()))?;
+    if bytes.len() > cfg.max_decoded_bytes {
+        return Err(ResizeError::LimitExceeded(format!(
+            "decoded image too large: {} > {} bytes",
+            bytes.len(),
+            cfg.max_decoded_bytes
+        )));
+    }
+    read_dimensions_from_raw(cfg, format, &bytes)
+}
+
+fn read_dimensions_from_raw(
+    cfg: ResizeConfig,
+    format: &str,
+    raw: &[u8],
+) -> Result<Option<(u32, u32)>, ResizeError> {
+    let cursor = Cursor::new(raw);
     let mut reader = ImageReader::new(cursor);
     if let Some(fmt) = guess_format(format) {
         reader.set_format(fmt);
     } else {
-        reader = reader.with_guessed_format().ok()?;
+        reader = match reader.with_guessed_format() {
+            Ok(r) => r,
+            Err(_) => return Ok(None),
+        };
     }
-    reader.into_dimensions().ok()
+    let Some((w, h)) = reader.into_dimensions().ok() else {
+        return Ok(None);
+    };
+    validate_pixel_count(cfg, w, h)?;
+    Ok(Some((w, h)))
+}
+
+fn validate_passthrough_safe(
+    cfg: ResizeConfig,
+    format: &str,
+    data_base64: &str,
+) -> Result<(), ResizeError> {
+    match peek_dimensions_checked(cfg, format, data_base64) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) | Err(ResizeError::Base64(_)) | Err(ResizeError::Decode(_))
+            if data_base64.len() <= cfg.max_bytes =>
+        {
+            Ok(())
+        }
+        Ok(None) | Err(ResizeError::Base64(_)) | Err(ResizeError::Decode(_)) => {
+            Err(ResizeError::LimitExceeded(
+                "oversized image payload has unknown or invalid dimensions".to_string(),
+            ))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Anthropic 图片 token 公式的长边上限：超过则按比例缩到该长边再计 token。
@@ -204,8 +343,16 @@ const IMAGE_TOKEN_FALLBACK: u32 = 1_600;
 
 /// 估算单张图片的输入 token，对齐 Anthropic 计费口径 `tokens ≈ (w×h)/750`。
 pub fn estimate_image_tokens(media_type: &str, data_base64: &str) -> u32 {
-    let format = media_type.rsplit('/').next().unwrap_or("").to_ascii_lowercase();
-    let Some((w, h)) = peek_dimensions(&format, data_base64) else {
+    let format = media_type
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let cfg = ResizeConfig::from_env();
+    let Some((w, h)) = peek_dimensions_checked(cfg, &format, data_base64)
+        .ok()
+        .flatten()
+    else {
         return IMAGE_TOKEN_FALLBACK;
     };
     if w == 0 || h == 0 {
@@ -242,9 +389,22 @@ fn shrink_static_image(
 ) -> Result<ProcessedImage, ResizeError> {
     let original_bytes = data_base64.len();
 
+    validate_base64_limits(cfg, data_base64)?;
     let raw = BASE64
         .decode(data_base64)
         .map_err(|e| ResizeError::Base64(e.to_string()))?;
+    if raw.len() > cfg.max_decoded_bytes {
+        return Err(ResizeError::LimitExceeded(format!(
+            "decoded image too large: {} > {} bytes",
+            raw.len(),
+            cfg.max_decoded_bytes
+        )));
+    }
+    let Some((w, h)) = read_dimensions_from_raw(cfg, format, &raw)? else {
+        return Err(ResizeError::Decode(
+            "image dimensions are unavailable".to_string(),
+        ));
+    };
 
     let cursor = Cursor::new(&raw);
     let mut reader = ImageReader::new(cursor);
@@ -260,7 +420,7 @@ fn shrink_static_image(
         .map_err(|e| ResizeError::Decode(e.to_string()))?;
 
     // Initial proportional scaling to the configured long-side cap (preserves aspect ratio).
-    let (w, h) = (img.width(), img.height());
+    let (w, h) = (w.max(img.width()), h.max(img.height()));
     let long_initial = w.max(h);
     let mut cur_long = long_initial.min(cfg.max_long_side).max(1);
 
@@ -326,8 +486,44 @@ fn shrink_static_image(
     })
 }
 
+fn validate_base64_limits(cfg: ResizeConfig, data_base64: &str) -> Result<(), ResizeError> {
+    if data_base64.len() > cfg.max_base64_bytes {
+        return Err(ResizeError::LimitExceeded(format!(
+            "image base64 too large: {} > {} bytes",
+            data_base64.len(),
+            cfg.max_base64_bytes
+        )));
+    }
+    let decoded_estimate = estimated_decoded_len(data_base64);
+    if decoded_estimate > cfg.max_decoded_bytes {
+        return Err(ResizeError::LimitExceeded(format!(
+            "decoded image too large: {} > {} bytes",
+            decoded_estimate, cfg.max_decoded_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn estimated_decoded_len(data_base64: &str) -> usize {
+    let trimmed = data_base64.trim_end_matches('=');
+    trimmed.len().saturating_mul(3) / 4
+}
+
+fn validate_pixel_count(cfg: ResizeConfig, w: u32, h: u32) -> Result<(), ResizeError> {
+    let pixels = (w as u64).saturating_mul(h as u64);
+    if pixels > cfg.max_pixels {
+        return Err(ResizeError::LimitExceeded(format!(
+            "image pixels too large: {} > {}",
+            pixels, cfg.max_pixels
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
-enum ResizeError {
+pub enum ResizeError {
+    #[error("image rejected: {0}")]
+    LimitExceeded(String),
     #[error("base64 decode: {0}")]
     Base64(String),
     #[error("image decode: {0}")]
@@ -355,16 +551,23 @@ mod tests {
         BASE64.encode(&buf)
     }
 
-    #[test]
-    fn small_image_passes_through() {
-        let cfg = ResizeConfig {
+    fn test_cfg() -> ResizeConfig {
+        ResizeConfig {
             enabled: true,
             max_long_side: 1568,
             max_bytes: 400_000,
             jpeg_quality: 85,
-        };
+            max_base64_bytes: 8 * 1024 * 1024,
+            max_decoded_bytes: 8 * 1024 * 1024,
+            max_pixels: 40_000_000,
+        }
+    }
+
+    #[test]
+    fn small_image_passes_through() {
+        let cfg = test_cfg();
         let small = make_png(64, 64);
-        let out = maybe_shrink_image(cfg, "png", &small);
+        let out = maybe_shrink_image(cfg, "png", &small).unwrap();
         assert!(!out.was_resized);
         assert_eq!(out.format, "png");
         assert_eq!(out.data_base64, small);
@@ -372,15 +575,10 @@ mod tests {
 
     #[test]
     fn iphone_screenshot_gets_shrunk_below_limit() {
-        let cfg = ResizeConfig {
-            enabled: true,
-            max_long_side: 1568,
-            max_bytes: 400_000,
-            jpeg_quality: 85,
-        };
+        let cfg = test_cfg();
         // 1206x2622 ~ iPhone Pro Max screenshot ratio
         let big = make_png(1206, 2622);
-        let out = maybe_shrink_image(cfg, "png", &big);
+        let out = maybe_shrink_image(cfg, "png", &big).unwrap();
         assert!(out.was_resized, "should have been resized");
         assert_eq!(out.format, "jpeg", "should have been re-encoded as JPEG");
         assert!(
@@ -399,13 +597,11 @@ mod tests {
         // Dimensions are under max_long_side, so the resize branch is skipped; the only way
         // to honor max_bytes is the progressive quality reduction in the encode loop.
         let cfg = ResizeConfig {
-            enabled: true,
-            max_long_side: 1568,
             max_bytes: 20_000,
-            jpeg_quality: 85,
+            ..test_cfg()
         };
         let img = make_png(1024, 1024);
-        let out = maybe_shrink_image(cfg, "png", &img);
+        let out = maybe_shrink_image(cfg, "png", &img).unwrap();
         assert!(out.was_resized, "should have been re-encoded");
         assert!(
             out.final_bytes <= cfg.max_bytes,
@@ -420,7 +616,7 @@ mod tests {
         let cfg = ResizeConfig::from_env();
         // A 1x1 GIF is enough; what matters here is exercising the branch
         let tiny_gif = "R0lGODlhAQABAAAAACw=";
-        let out = maybe_shrink_image(cfg, "gif", tiny_gif);
+        let out = maybe_shrink_image(cfg, "gif", tiny_gif).unwrap();
         assert!(!out.was_resized);
         assert_eq!(out.format, "gif");
     }
@@ -429,27 +625,24 @@ mod tests {
     fn disabled_config_passes_through_even_huge() {
         let cfg = ResizeConfig {
             enabled: false,
-            max_long_side: 1568,
-            max_bytes: 400_000,
-            jpeg_quality: 85,
+            ..test_cfg()
         };
         let big = make_png(1206, 2622);
-        let out = maybe_shrink_image(cfg, "png", &big);
+        let out = maybe_shrink_image(cfg, "png", &big).unwrap();
         assert!(!out.was_resized);
         assert_eq!(out.format, "png");
     }
 
     #[test]
-    fn corrupt_data_passes_through_with_warning() {
+    fn small_corrupt_data_passes_through_with_warning() {
         let cfg = ResizeConfig {
-            enabled: true,
             max_long_side: 1568,
-            max_bytes: 100,
-            jpeg_quality: 85,
+            max_bytes: 2_000,
+            ..test_cfg()
         };
-        // Deliberately feed corrupt data + over-limit bytes to trigger the decode path
+        // Small corrupt data can still pass through for upstream MIME validation.
         let bogus = "X".repeat(1000);
-        let out = maybe_shrink_image(cfg, "png", &bogus);
+        let out = maybe_shrink_image(cfg, "png", &bogus).unwrap();
         assert!(!out.was_resized, "corrupt input should fall through");
         assert_eq!(out.format, "png");
         assert_eq!(out.data_base64, bogus);
@@ -471,16 +664,11 @@ mod tests {
 
     #[test]
     fn mislabeled_png_header_jpeg_bytes_corrected_to_jpeg() {
-        let cfg = ResizeConfig {
-            enabled: true,
-            max_long_side: 1568,
-            max_bytes: 400_000,
-            jpeg_quality: 85,
-        };
+        let cfg = test_cfg();
         // Real JPEG bytes, but the caller mislabels format="png" (host-side header/body mismatch, faithfully passed through).
         // Small images take the passthrough path. The outbound format must be corrected to jpeg per the real bytes, otherwise Bedrock returns IMAGE_MIME_MISMATCH.
         let jpeg = make_jpeg(64, 64);
-        let out = maybe_shrink_image(cfg, "png", &jpeg);
+        let out = maybe_shrink_image(cfg, "png", &jpeg).unwrap();
         assert_eq!(out.data_base64, jpeg, "must not mutate image bytes");
         assert_eq!(
             out.format, "jpeg",
@@ -492,7 +680,7 @@ mod tests {
     fn matching_png_kept_as_png() {
         let cfg = ResizeConfig::from_env();
         let png = make_png(64, 64);
-        let out = maybe_shrink_image(cfg, "png", &png);
+        let out = maybe_shrink_image(cfg, "png", &png).unwrap();
         assert_eq!(out.format, "png", "real png must stay png");
         assert_eq!(out.data_base64, png);
     }
@@ -501,7 +689,7 @@ mod tests {
     fn matching_jpeg_kept_as_jpeg() {
         let cfg = ResizeConfig::from_env();
         let jpeg = make_jpeg(64, 64);
-        let out = maybe_shrink_image(cfg, "jpeg", &jpeg);
+        let out = maybe_shrink_image(cfg, "jpeg", &jpeg).unwrap();
         assert_eq!(out.format, "jpeg", "real jpeg must stay jpeg");
         assert_eq!(out.data_base64, jpeg);
     }
@@ -511,13 +699,65 @@ mod tests {
         // Detection fails on corrupt data -> keep the incoming format, never drop the image.
         let cfg = ResizeConfig {
             enabled: false,
-            max_long_side: 1568,
-            max_bytes: 400_000,
-            jpeg_quality: 85,
+            ..test_cfg()
         };
         let bogus = "X".repeat(40);
-        let out = maybe_shrink_image(cfg, "png", &bogus);
+        let out = maybe_shrink_image(cfg, "png", &bogus).unwrap();
         assert_eq!(out.format, "png", "undetectable bytes keep declared format");
         assert_eq!(out.data_base64, bogus);
+    }
+
+    #[test]
+    fn oversized_base64_is_rejected_before_decode() {
+        let cfg = ResizeConfig {
+            max_base64_bytes: 32,
+            max_decoded_bytes: 1024,
+            ..test_cfg()
+        };
+        let err = maybe_shrink_image(cfg, "png", &"A".repeat(64)).unwrap_err();
+        assert!(matches!(err, ResizeError::LimitExceeded(_)));
+    }
+
+    #[test]
+    fn oversized_decoded_bytes_are_rejected_by_estimate() {
+        let cfg = ResizeConfig {
+            max_base64_bytes: 1024,
+            max_decoded_bytes: 16,
+            ..test_cfg()
+        };
+        let err = maybe_shrink_image(cfg, "png", &"A".repeat(64)).unwrap_err();
+        assert!(matches!(err, ResizeError::LimitExceeded(_)));
+    }
+
+    #[test]
+    fn oversized_pixels_are_rejected_before_full_decode() {
+        let cfg = ResizeConfig {
+            max_pixels: 1_000,
+            ..test_cfg()
+        };
+        let img = make_png(64, 64);
+        let err = maybe_shrink_image(cfg, "png", &img).unwrap_err();
+        assert!(matches!(err, ResizeError::LimitExceeded(_)));
+    }
+
+    #[test]
+    fn oversized_corrupt_payload_is_not_passed_through() {
+        let cfg = ResizeConfig {
+            max_bytes: 100,
+            ..test_cfg()
+        };
+        let bogus = "X".repeat(1000);
+        assert!(maybe_shrink_image(cfg, "png", &bogus).is_err());
+    }
+
+    #[test]
+    fn request_image_limits_reject_count_and_total() {
+        let limits = RequestImageLimits {
+            max_count: 2,
+            max_total_base64_bytes: 100,
+        };
+        assert!(limits.validate(3, 10).is_err());
+        assert!(limits.validate(2, 101).is_err());
+        assert!(limits.validate(2, 100).is_ok());
     }
 }

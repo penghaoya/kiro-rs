@@ -103,7 +103,8 @@ pub mod outcome {
 
 /// 把上游错误体截断到安全长度（按字符边界，避免切碎 UTF-8）
 pub fn truncate_snippet(body: &str) -> Option<String> {
-    let trimmed = body.trim();
+    let redacted = crate::security::redact_text(body);
+    let trimmed = redacted.trim();
     if trimmed.is_empty() {
         return None;
     }

@@ -4,7 +4,7 @@
 
 ## 本增强版说明
 
-这是面向 Claude Code 与新版 Kiro 的增强兼容分支，目标是在本地或服务器部署后，作为稳定的 Anthropic API 兼容代理使用。
+这是面向 Claude Code 与新版 Kiro 的增强兼容分支，目标是在自托管环境中作为稳定的 Anthropic API 兼容代理使用。
 
 ## 重点：Claude Code 工具调用兼容
 
@@ -36,7 +36,7 @@
 - [chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager)：参考最新版 Kiro 账号、thinking/effort、Enterprise profileArn、工具调用与账号导入导出相关行为。
 - 本地 `429修复` 补丁目录：合入普通 429 冷却、账号级风控故障转移、重试策略与相关管理面板展示逻辑。
 
-感谢以上项目作者和贡献者。本分支的主要工作是把这些实现按当前 Kiro CLI / IDE 实测行为重新梳理、合并冲突、补兼容层、补测试，并完成服务器部署验证。
+感谢以上项目作者和贡献者。本分支的主要工作是把这些实现按当前 Kiro CLI / IDE 实测行为重新梳理、合并冲突、补兼容层、补测试，并完成本地构建与兼容性验证。
 
 ---
 

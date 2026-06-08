@@ -374,6 +374,7 @@ pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
     UnsupportedToolMapping(String),
+    InvalidImage(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -384,6 +385,7 @@ impl std::fmt::Display for ConversionError {
             ConversionError::UnsupportedToolMapping(message) => {
                 write!(f, "工具映射不支持: {}", message)
             }
+            ConversionError::InvalidImage(message) => write!(f, "图片无效: {}", message),
         }
     }
 }
@@ -647,11 +649,12 @@ fn process_message_content_dedup(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source
-                                && let Some(placeholder) =
-                                    extract_kiro_image(&source, &mut dedup, &mut images)
-                            {
-                                text_parts.push(placeholder);
+                            if let Some(source) = block.source {
+                                if let Some(placeholder) =
+                                    extract_kiro_image(&source, &mut dedup, &mut images)?
+                                {
+                                    text_parts.push(placeholder);
+                                }
                             }
                         }
                         "tool_result" => {
@@ -660,7 +663,7 @@ fn process_message_content_dedup(
                                     &block.content,
                                     &mut dedup,
                                     &mut images,
-                                );
+                                )?;
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -708,24 +711,33 @@ fn extract_kiro_image(
     source: &ImageSource,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
-) -> Option<String> {
-    let format = get_image_format(&source.media_type)?;
+) -> Result<Option<String>, ConversionError> {
+    let Some(format) = get_image_format(&source.media_type) else {
+        return Ok(None);
+    };
     // History dedup: an already-seen image omits its base64 and returns placeholder text
     if let Some(seen) = dedup.as_deref_mut() {
         let mut hasher = Sha256::new();
         hasher.update(source.data.as_bytes());
         let digest = format!("{:x}", hasher.finalize());
         if !seen.insert(digest) {
-            return Some("[image omitted: identical to an earlier screenshot]".to_string());
+            return Ok(Some(
+                "[image omitted: identical to an earlier screenshot]".to_string(),
+            ));
         }
     }
     let cfg = ResizeConfig::from_env();
-    let processed = maybe_shrink_image(cfg, &format, &source.data);
+    let processed = maybe_shrink_image(cfg, &format, &source.data).map_err(|e| {
+        ConversionError::InvalidImage(format!(
+            "{} image rejected by safety limits: {}",
+            source.media_type, e
+        ))
+    })?;
     images.push(KiroImage::from_base64(
         processed.format,
         processed.data_base64,
     ));
-    None
+    Ok(None)
 }
 
 /// 提取工具结果内容
@@ -737,9 +749,9 @@ fn extract_tool_result_content(
     content: &Option<serde_json::Value>,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
-) -> String {
+) -> Result<String, ConversionError> {
     match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::String(s)) => Ok(s.clone()),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
             let mut had_image = false;
@@ -751,19 +763,19 @@ fn extract_tool_result_content(
                     && let Some(source) = block.source
                 {
                     had_image = true;
-                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images) {
+                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images)? {
                         parts.push(placeholder);
                     }
                 }
             }
-            if parts.is_empty() && had_image {
+            Ok(if parts.is_empty() && had_image {
                 "[image attached]".to_string()
             } else {
                 parts.join("\n")
-            }
+            })
         }
-        Some(v) => v.to_string(),
-        None => String::new(),
+        Some(v) => Ok(v.to_string()),
+        None => Ok(String::new()),
     }
 }
 

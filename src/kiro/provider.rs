@@ -477,7 +477,10 @@ impl KiroProvider {
             let body = endpoint.transform_api_body(request_body, &rctx);
 
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
-            tracing::debug!("实际发送请求体: {}", body);
+            tracing::debug!(
+                "实际发送请求体: {}",
+                crate::security::body_log_summary(&body)
+            );
 
             let base = self
                 .client_for(&ctx.credentials)?
@@ -493,7 +496,12 @@ impl KiroProvider {
                 .map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
             if tracing::enabled!(tracing::Level::DEBUG) {
                 for (k, v) in request.headers() {
-                    tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
+                    let value = v.to_str().unwrap_or("<binary>");
+                    tracing::debug!(
+                        "  header {}: {}",
+                        k,
+                        crate::security::redact_header_value(k.as_str(), value)
+                    );
                 }
             }
             let response = match self.client_for(&ctx.credentials)?.execute(request).await {

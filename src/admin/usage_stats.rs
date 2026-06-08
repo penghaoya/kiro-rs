@@ -22,6 +22,8 @@ const RETENTION_DAYS: i64 = 31;
 const HOUR_BUCKETS: usize = 24 * 7;
 /// 天桶数量（31 天）
 const DAY_BUCKETS: usize = 31;
+const USAGE_FLUSH_EVERY_RECORDS: u64 = 64;
+const USAGE_FLUSH_EVERY_SECS: i64 = 5;
 
 /// 单次请求的用量记录（与 JSONL 一行一一对应）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +65,8 @@ struct RecorderState {
     /// 当前打开的 writer 与对应日期
     current_date: Option<NaiveDate>,
     writer: Option<BufWriter<File>>,
+    pending_flush_records: u64,
+    last_flush_ts: i64,
 }
 
 impl UsageRecorder {
@@ -83,6 +87,8 @@ impl UsageRecorder {
             inner: Mutex::new(RecorderState {
                 current_date: None,
                 writer: None,
+                pending_flush_records: 0,
+                last_flush_ts: Utc::now().timestamp(),
             }),
             dir,
             retention_days: std::sync::atomic::AtomicI64::new(retention_days.max(1)),
@@ -124,8 +130,17 @@ impl UsageRecorder {
                 tracing::warn!("写入 usage_log 失败: {}", e);
                 return;
             }
-            // 立即 flush，保证崩溃时不丢失最近一条
-            let _ = w.flush();
+        }
+        state.pending_flush_records = state.pending_flush_records.saturating_add(1);
+        let now = Utc::now().timestamp();
+        let should_flush = state.pending_flush_records >= USAGE_FLUSH_EVERY_RECORDS
+            || now.saturating_sub(state.last_flush_ts) >= USAGE_FLUSH_EVERY_SECS;
+        if should_flush {
+            if let Some(w) = state.writer.as_mut() {
+                let _ = w.flush();
+            }
+            state.pending_flush_records = 0;
+            state.last_flush_ts = now;
         }
     }
 

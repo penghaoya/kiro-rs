@@ -22,8 +22,8 @@
 //! axum::serve(listener, app).await?;
 //! ```
 
-mod converter;
 pub mod cache_metering;
+mod converter;
 mod handlers;
 mod middleware;
 mod router;

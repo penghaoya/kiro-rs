@@ -1,11 +1,13 @@
 //! Anthropic API Handler 函数
 
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::trace_db::{SharedTraceStore, TraceAttempt, TraceRecord, TraceSink, outcome};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
+use crate::image_resize::RequestImageLimits;
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -26,7 +28,8 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_mode};
+use super::cache_metering::CacheUsagePlan;
+use super::converter::{ConversionError, ConversionResult, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext, ToolJsonAccumulator};
 use super::types::{
@@ -34,6 +37,8 @@ use super::types::{
     OutputConfig, Thinking, normalize_thinking_effort,
 };
 use super::websearch;
+
+type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>;
 
 fn normalize_web_search_tool(payload: &mut MessagesRequest) {
     if let Some(tools) = payload.tools.as_mut() {
@@ -198,7 +203,7 @@ impl RequestTracer {
             final_status: final_status.to_string(),
             final_credential_id,
             error_type: error_type.map(|s| s.to_string()),
-            error_message: error_message.map(|s| s.to_string()),
+            error_message: error_message.map(crate::security::redact_text),
             total_attempts: attempts.len() as u32,
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             interrupted_after_bytes,
@@ -220,7 +225,7 @@ impl TraceSink for RequestTracer {
 
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
 /// 返回 'static str（outcome 常量），无 attempt 时返回 None。
-fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
+pub(super) fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     let last = tracer.attempts.lock().last()?.outcome.clone();
     Some(match last.as_str() {
         outcome::QUOTA_EXHAUSTED => outcome::QUOTA_EXHAUSTED,
@@ -239,6 +244,7 @@ fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
 const IMAGE_BUDGET_WARN_BYTES: usize = 800 * 1024;
 
 /// Budget statistics for the image content in one inbound request.
+#[derive(Debug, Clone, Copy)]
 struct ImageBudget {
     count: usize,
     total_b64_bytes: usize,
@@ -254,27 +260,7 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     let mut largest = 0usize;
     for msg in &payload.messages {
         if let serde_json::Value::Array(arr) = &msg.content {
-            for item in arr {
-                if item.get("type").and_then(|v| v.as_str()) != Some("image") {
-                    continue;
-                }
-                let Some(src) = item.get("source") else {
-                    continue;
-                };
-                if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
-                    continue;
-                }
-                let n = src
-                    .get("data")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.len())
-                    .unwrap_or(0);
-                count += 1;
-                total += n;
-                if n > largest {
-                    largest = n;
-                }
-            }
+            count_images_in_blocks(arr, &mut count, &mut total, &mut largest);
         }
     }
     ImageBudget {
@@ -284,8 +270,98 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
-pub(super) fn map_provider_error(err: Error) -> Response {
+fn count_images_in_blocks(
+    blocks: &[serde_json::Value],
+    count: &mut usize,
+    total: &mut usize,
+    largest: &mut usize,
+) {
+    for item in blocks {
+        match item.get("type").and_then(|v| v.as_str()) {
+            Some("image") => count_image_source(item.get("source"), count, total, largest),
+            Some("tool_result") => {
+                if let Some(serde_json::Value::Array(content)) = item.get("content") {
+                    count_images_in_blocks(content, count, total, largest);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn count_image_source(
+    source: Option<&serde_json::Value>,
+    count: &mut usize,
+    total: &mut usize,
+    largest: &mut usize,
+) {
+    let Some(src) = source else {
+        return;
+    };
+    if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
+        return;
+    }
+    let n = src
+        .get("data")
+        .and_then(|v| v.as_str())
+        .map(|s| s.len())
+        .unwrap_or(0);
+    *count += 1;
+    *total += n;
+    *largest = (*largest).max(n);
+}
+
+fn validate_image_budget_or_response(
+    budget: &ImageBudget,
+    hook: &UsageRecordHook,
+) -> Option<Response> {
+    match RequestImageLimits::from_env().validate(budget.count, budget.total_b64_bytes) {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "incoming image payload rejected by safety limits");
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
+            Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new("invalid_request_error", e.to_string())),
+                )
+                    .into_response(),
+            )
+        }
+    }
+}
+
+pub(super) async fn convert_request_with_mode_blocking(
+    payload: MessagesRequest,
+    tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
+) -> Result<ConversionResult, ConversionError> {
+    match tokio::task::spawn_blocking(move || {
+        convert_request_with_mode(&payload, tool_compatibility_mode)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(ConversionError::InvalidImage(format!(
+            "image/request conversion task failed: {}",
+            e
+        ))),
+    }
+}
+
+fn conversion_error_response(e: &ConversionError) -> (&'static str, String) {
+    match e {
+        ConversionError::UnsupportedModel(model) => {
+            ("invalid_request_error", format!("模型不支持: {}", model))
+        }
+        ConversionError::EmptyMessages => ("invalid_request_error", "消息列表为空".to_string()),
+        ConversionError::UnsupportedToolMapping(message) => {
+            ("unsupported_tool_mapping", message.clone())
+        }
+        ConversionError::InvalidImage(message) => ("invalid_request_error", message.clone()),
+    }
+}
+
+fn provider_error_status_and_detail(err: &Error) -> (StatusCode, &'static str, String) {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -293,12 +369,10 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            )),
-        )
-            .into_response();
+            "invalid_request_error",
+            "Context window is full. Reduce conversation history, system prompt, or tools."
+                .to_string(),
+        );
     }
 
     // 单次输入太长（请求体本身超出上游限制）
@@ -306,12 +380,9 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Input is too long. Reduce the size of your messages.",
-            )),
-        )
-            .into_response();
+            "invalid_request_error",
+            "Input is too long. Reduce the size of your messages.".to_string(),
+        );
     }
 
     // Bedrock client-side validation errors (tool_use <-> tool_result mismatch, invalid message sequence, etc.)
@@ -329,23 +400,28 @@ pub(super) fn map_provider_error(err: Error) -> Response {
         // The full error is already logged above for diagnostics.
         return (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse::new(
-                "invalid_request_error",
-                "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
-            )),
-        )
-            .into_response();
+            "invalid_request_error",
+            "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
+        );
     }
 
-    tracing::error!("Kiro API 调用失败: {}", err);
+    let trace_hint = uuid::Uuid::new_v4().to_string();
+    tracing::error!(
+        trace_id = %trace_hint,
+        error = %crate::security::redact_text(&err_str),
+        "Kiro API 调用失败"
+    );
     (
         StatusCode::BAD_GATEWAY,
-        Json(ErrorResponse::new(
-            "api_error",
-            format!("上游 API 调用失败: {}", err),
-        )),
+        "api_error",
+        format!("Upstream request failed. trace_id={trace_hint}"),
     )
-        .into_response()
+}
+
+/// 将 KiroProvider 错误映射为 HTTP 响应
+pub(super) fn map_provider_error(err: Error) -> Response {
+    let (status, error_type, message) = provider_error_status_and_detail(&err);
+    (status, Json(ErrorResponse::new(error_type, message))).into_response()
 }
 
 /// 计算 Anthropic usage 口径的 input_tokens
@@ -529,6 +605,9 @@ pub async fn post_messages(
         );
     }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    if let Some(resp) = validate_image_budget_or_response(&img_stats, &hook) {
+        return resp;
+    }
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -558,20 +637,28 @@ pub async fn post_messages(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let cache_usage = state
+    let cache_plan = state
         .cache_meter
         .as_ref()
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
+
+    let payload_stream = payload.stream;
 
     // 检查是否为 direct WebSearch 请求。真实 Claude Code 会把动态 system-reminder
     // 放在首个 user text block，此时必须走 agentic loop，让 Kiro 模型自己产出 query。
     if websearch::has_web_search_tool(&payload) && websearch::is_direct_web_search_request(&payload)
     {
         tracing::info!("检测到 direct WebSearch 工具，路由到 MCP 快路径");
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            key_ctx.key_id,
+            payload.model.clone(),
+            payload_stream,
+        ));
 
         let (input_tokens, cache_creation_tokens, cache_read_tokens) =
-            cache_usage.split_against_total(total_input_tokens);
+            cache_plan.split_against_total(total_input_tokens);
 
         let resp = websearch::handle_websearch_request(
             provider,
@@ -587,6 +674,11 @@ pub async fn post_messages(
         } else {
             "error"
         };
+        if status == "success" {
+            cache_plan.commit_success();
+        }
+        tracer.set_usage(input_tokens, 0, cache_creation_tokens, cache_read_tokens);
+        tracer.finalize(status, None, None, None);
         hook.record(
             0,
             input_tokens,
@@ -599,49 +691,47 @@ pub async fn post_messages(
         return resp;
     }
 
-    let payload_stream = payload.stream;
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_tool(&payload) || websearch::has_web_search_among_tools(&payload) {
         tracing::info!(
             "detected tools containing web_search, entering the web_search agentic loop"
         );
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            key_ctx.key_id,
+            payload.model.clone(),
+            payload_stream,
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
             payload_stream,
             state.tool_compatibility_mode,
-            cache_usage,
+            cache_plan,
+            tracer,
         )
         .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
-    {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::UnsupportedToolMapping(message) => {
-                    ("unsupported_tool_mapping", message.clone())
-                }
-            };
-            tracing::warn!("请求转换失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
-        }
-    };
+    let conversion_result =
+        match convert_request_with_mode_blocking(payload.clone(), state.tool_compatibility_mode)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let (error_type, message) = conversion_error_response(&e);
+                tracing::warn!("请求转换失败: {}", e);
+                hook.record(0, 0, 0, 0, 0, 0.0, "error");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(error_type, message)),
+                )
+                    .into_response();
+            }
+        };
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
@@ -667,7 +757,10 @@ pub async fn post_messages(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        "Kiro request body: {}",
+        crate::security::body_log_summary(&request_body)
+    );
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -694,7 +787,7 @@ pub async fn post_messages(
             thinking_enabled,
             tool_name_map,
             hook,
-            cache_usage,
+            cache_plan,
             tracer,
         )
         .await
@@ -715,7 +808,7 @@ pub async fn post_messages(
             extract_thinking,
             tool_name_map,
             hook,
-            cache_usage,
+            cache_plan,
             tracer,
         )
         .await
@@ -731,40 +824,20 @@ async fn handle_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
-    cache_usage: super::cache_metering::CacheUsage,
+    cache_plan: CacheUsagePlan,
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()))
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-            );
-            return map_provider_error(e);
-        }
-    };
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
-
-    // 创建流处理上下文
-    let mut ctx =
-        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
-    ctx.cache_usage = cache_usage;
-
-    // 生成初始事件
-    let initial_events = ctx.generate_initial_events();
-
-    // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
+    let stream = create_deferred_sse_stream(
+        provider,
+        request_body.to_string(),
+        model.to_string(),
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        hook,
+        cache_plan,
+        tracer,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -784,6 +857,81 @@ fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
 }
 
+fn create_error_sse(error_type: &str, message: String) -> Bytes {
+    Bytes::from(
+        SseEvent::new(
+            "error",
+            json!({
+                "type": "error",
+                "error": {
+                    "type": error_type,
+                    "message": message,
+                }
+            }),
+        )
+        .to_sse_string(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_deferred_sse_stream(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    model: String,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    hook: UsageRecordHook,
+    cache_plan: CacheUsagePlan,
+    tracer: std::sync::Arc<RequestTracer>,
+) -> ByteStream {
+    // CCH records TTFB when the first downstream byte arrives. Do not emit a
+    // synthetic prelude here; the first downstream byte is delayed until the
+    // upstream response body yields real bytes.
+    let upstream = stream::once(async move {
+        let call_result = match provider
+            .call_api_stream(&request_body, Some(tracer.as_ref()))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+                tracer.finalize(
+                    "error",
+                    last_attempt_outcome(&tracer),
+                    Some(&e.to_string()),
+                    None,
+                );
+                let (_, error_type, message) = provider_error_status_and_detail(&e);
+                return Box::pin(stream::iter(vec![Ok(create_error_sse(
+                    error_type, message,
+                ))])) as ByteStream;
+            }
+        };
+
+        let response = call_result.response;
+        let credential_id = call_result.credential_id;
+
+        let mut ctx =
+            StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+        ctx.cache_usage = cache_plan.usage();
+
+        let initial_events = ctx.generate_initial_events();
+        Box::pin(create_sse_stream(
+            response,
+            ctx,
+            initial_events,
+            hook,
+            credential_id,
+            tracer,
+            cache_plan,
+        )) as ByteStream
+    })
+    .flatten();
+
+    Box::pin(upstream)
+}
+
 /// 创建 SSE 事件流
 fn create_sse_stream(
     response: reqwest::Response,
@@ -792,20 +940,27 @@ fn create_sse_stream(
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    cache_plan: CacheUsagePlan,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    // 先发送初始事件
-    let initial_stream = stream::iter(
-        initial_events
-            .into_iter()
-            .map(|e| Ok(Bytes::from(e.to_sse_string()))),
-    );
-
-    // 然后处理 Kiro 响应流，同时每25秒发送 ping 保活
+    // 初始事件不能在读到上游 body 前发送，否则 CCH 会把代理的占位字节当成
+    // 模型 TTFB。这里将它们挂起，等首个真实 upstream chunk 到达后再一起发出。
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        (
+            body_stream,
+            ctx,
+            EventStreamDecoder::new(),
+            false,
+            interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            hook,
+            credential_id,
+            tracer,
+            0u64,
+            cache_plan,
+            Some(initial_events),
+        ),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, cache_plan, mut pending_initial_events)| async move {
             if finished {
                 return None;
             }
@@ -817,12 +972,16 @@ fn create_sse_stream(
                     match chunk_result {
                         Some(Ok(chunk)) => {
                             sent_bytes += chunk.len() as u64;
+                            let mut events = pending_initial_events.take().unwrap_or_default();
+                            if !events.is_empty() {
+                                ping_interval.reset();
+                            }
+
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
                             }
 
-                            let mut events = Vec::new();
                             for result in decoder.decode_iter() {
                                 match result {
                                     Ok(frame) => {
@@ -843,12 +1002,13 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 发送最终事件并结束（记为 error）
-                            let final_events = ctx.generate_final_events();
+                            let mut final_events = pending_initial_events.take().unwrap_or_default();
+                            final_events.extend(ctx.generate_final_events());
                             record_stream_usage(&hook, &ctx, credential_id, "error", &tracer);
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             tracer.finalize(
@@ -861,39 +1021,41 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events)))
                         }
                         None => {
                             // 流结束，发送最终事件
-                            let final_events = ctx.generate_final_events();
+                            let mut final_events = pending_initial_events.take().unwrap_or_default();
+                            final_events.extend(ctx.generate_final_events());
                             let tool_json_error = ctx.tool_json_error_message();
                             if let Some(message) = tool_json_error.as_deref() {
                                 record_stream_usage(&hook, &ctx, credential_id, "error", &tracer);
                                 tracer.finalize("error", Some(outcome::BAD_REQUEST), Some(message), None);
                             } else {
                                 record_stream_usage(&hook, &ctx, credential_id, "success", &tracer);
+                                cache_plan.commit_success();
                                 tracer.finalize("success", None, None, None);
                             }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events)))
                         }
                     }
                 }
                 // 发送 ping 保活
-                _ = ping_interval.tick() => {
+                _ = ping_interval.tick(), if pending_initial_events.is_none() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events)))
                 }
             }
         },
     )
     .flatten();
 
-    initial_stream.chain(processing_stream)
+    processing_stream
 }
 
 /// 从 StreamContext 提取最终用量，写入 hook，并同步给 tracer。
@@ -928,7 +1090,7 @@ async fn handle_non_stream_request(
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
-    cache_usage: super::cache_metering::CacheUsage,
+    cache_plan: CacheUsagePlan,
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -980,7 +1142,6 @@ async fn handle_non_stream_request(
     let mut text_content = String::new();
     let mut reasoning_content = String::new();
     let mut redacted_reasoning_content = String::new();
-    let mut reasoning_signature: Option<String> = None;
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
@@ -1011,11 +1172,6 @@ async fn handle_non_stream_request(
                             } else if let Some(redacted) = reasoning.redacted_content.as_ref() {
                                 redacted_reasoning_content.push_str(redacted);
                             }
-                            if let Some(signature) =
-                                reasoning.signature.as_ref().filter(|s| !s.is_empty())
-                            {
-                                reasoning_signature = Some(signature.clone());
-                            }
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -1037,7 +1193,7 @@ async fn handle_non_stream_request(
                                         context_input_tokens,
                                     );
                                     let (input, cache_creation, cache_read) =
-                                        cache_usage.split_against_total(total_input);
+                                        cache_plan.split_against_total(total_input);
                                     hook.record(
                                         credential_id,
                                         input,
@@ -1102,7 +1258,7 @@ async fn handle_non_stream_request(
     if let Err(e) = tool_accumulator.finish() {
         tracing::error!("{}", e);
         let total_input = resolve_usage_input_tokens(input_tokens, context_input_tokens);
-        let (input, cache_creation, cache_read) = cache_usage.split_against_total(total_input);
+        let (input, cache_creation, cache_read) = cache_plan.split_against_total(total_input);
         hook.record(
             credential_id,
             input,
@@ -1136,34 +1292,23 @@ async fn handle_non_stream_request(
     let mut content: Vec<serde_json::Value> = Vec::new();
 
     if thinking_enabled {
-        let (thinking, remaining_text, signature) = if !reasoning_content.is_empty() {
-            (
-                Some(reasoning_content),
-                text_content,
-                reasoning_signature
-                    .as_deref()
-                    .unwrap_or(super::stream::THINKING_SIGNATURE_PLACEHOLDER)
-                    .to_string(),
-            )
+        let (thinking, remaining_text) = if !reasoning_content.is_empty() {
+            (Some(reasoning_content), text_content)
         } else {
             // 从完整文本中提取 thinking 块
             let (thinking, remaining_text) =
                 super::stream::extract_thinking_from_complete_text(&text_content);
-            (
-                thinking,
-                remaining_text,
-                super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string(),
-            )
+            (thinking, remaining_text)
         };
 
         if let Some(thinking_text) = thinking {
-            // signature 占位字符串：上游 Kiro 不下发真实 Anthropic 签名，
-            // 但 thinking 模式下客户端要求 thinking 块带 signature 字段，
-            // 否则下一轮回传时 SDK 本地校验会拒绝（"must be passed back"）
+            // signature 占位字符串：Kiro reasoning signature 不是 Anthropic
+            // thinking signature，不能透传给下游。客户端只要求非空 signature
+            // 以通过下一轮本地校验（"must be passed back"）。
             content.push(json!({
                 "type": "thinking",
                 "thinking": thinking_text,
-                "signature": signature,
+                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
             }));
         }
 
@@ -1180,11 +1325,13 @@ async fn handle_non_stream_request(
                 "text": remaining_text
             }));
         }
-    } else if !text_content.is_empty() {
-        content.push(json!({
-            "type": "text",
-            "text": text_content
-        }));
+    } else {
+        if !text_content.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": text_content
+            }));
+        }
     }
 
     content.extend(tool_uses);
@@ -1195,7 +1342,7 @@ async fn handle_non_stream_request(
     // 全量 prompt token：contextUsage 真实值优先，否则用客户端估算。
     let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_against_total(total_input_tokens);
+        cache_plan.split_against_total(total_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1223,6 +1370,7 @@ async fn handle_non_stream_request(
         credits,
         "success",
     );
+    cache_plan.commit_success();
     tracer.set_usage(
         final_input_tokens,
         output_tokens,
@@ -1342,14 +1490,21 @@ pub async fn post_messages_cc(
     Extension(key_ctx): Extension<KeyContext>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    let img_stats = count_image_budget(&payload);
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
+        image_count = %img_stats.count,
+        image_total_b64_kb = %(img_stats.total_b64_bytes / 1024),
+        image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /cc/v1/messages request"
     );
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    if let Some(resp) = validate_image_budget_or_response(&img_stats, &hook) {
+        return resp;
+    }
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1380,20 +1535,28 @@ pub async fn post_messages_cc(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-    let cache_usage = state
+    let cache_plan = state
         .cache_meter
         .as_ref()
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
+
+    let payload_stream = payload.stream;
 
     // 检查是否为 direct WebSearch 请求。真实 Claude Code 会把动态 system-reminder
     // 放在首个 user text block，此时必须走 agentic loop，让 Kiro 模型自己产出 query。
     if websearch::has_web_search_tool(&payload) && websearch::is_direct_web_search_request(&payload)
     {
         tracing::info!("检测到 direct WebSearch 工具，路由到 MCP 快路径");
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            key_ctx.key_id,
+            payload.model.clone(),
+            payload_stream,
+        ));
 
         let (input_tokens, cache_creation_tokens, cache_read_tokens) =
-            cache_usage.split_against_total(total_input_tokens);
+            cache_plan.split_against_total(total_input_tokens);
 
         let resp = websearch::handle_websearch_request(
             provider,
@@ -1408,6 +1571,11 @@ pub async fn post_messages_cc(
         } else {
             "error"
         };
+        if status == "success" {
+            cache_plan.commit_success();
+        }
+        tracer.set_usage(input_tokens, 0, cache_creation_tokens, cache_read_tokens);
+        tracer.finalize(status, None, None, None);
         hook.record(
             0,
             input_tokens,
@@ -1420,49 +1588,47 @@ pub async fn post_messages_cc(
         return resp;
     }
 
-    let payload_stream = payload.stream;
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_tool(&payload) || websearch::has_web_search_among_tools(&payload) {
         tracing::info!(
             "detected tools containing web_search, entering the web_search agentic loop"
         );
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            key_ctx.key_id,
+            payload.model.clone(),
+            payload_stream,
+        ));
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
             payload_stream,
             state.tool_compatibility_mode,
-            cache_usage,
+            cache_plan,
+            tracer,
         )
         .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode)
-    {
-        Ok(result) => result,
-        Err(e) => {
-            let (error_type, message) = match &e {
-                ConversionError::UnsupportedModel(model) => {
-                    ("invalid_request_error", format!("模型不支持: {}", model))
-                }
-                ConversionError::EmptyMessages => {
-                    ("invalid_request_error", "消息列表为空".to_string())
-                }
-                ConversionError::UnsupportedToolMapping(message) => {
-                    ("unsupported_tool_mapping", message.clone())
-                }
-            };
-            tracing::warn!("请求转换失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, 0.0, "error");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(error_type, message)),
-            )
-                .into_response();
-        }
-    };
+    let conversion_result =
+        match convert_request_with_mode_blocking(payload.clone(), state.tool_compatibility_mode)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let (error_type, message) = conversion_error_response(&e);
+                tracing::warn!("请求转换失败: {}", e);
+                hook.record(0, 0, 0, 0, 0, 0.0, "error");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(error_type, message)),
+                )
+                    .into_response();
+            }
+        };
 
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
@@ -1488,7 +1654,10 @@ pub async fn post_messages_cc(
         }
     };
 
-    tracing::debug!("Kiro request body: {}", request_body);
+    tracing::debug!(
+        "Kiro request body: {}",
+        crate::security::body_log_summary(&request_body)
+    );
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1515,7 +1684,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             hook,
             total_input_tokens,
-            cache_usage,
+            cache_plan,
             tracer,
         )
         .await
@@ -1536,7 +1705,7 @@ pub async fn post_messages_cc(
             extract_thinking,
             tool_name_map,
             hook,
-            cache_usage,
+            cache_plan,
             tracer,
         )
         .await
@@ -1555,40 +1724,20 @@ async fn handle_stream_request_buffered(
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
-    cache_usage: super::cache_metering::CacheUsage,
+    cache_plan: CacheUsagePlan,
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()))
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-            );
-            return map_provider_error(e);
-        }
-    };
-    let response = call_result.response;
-    let credential_id = call_result.credential_id;
-
-    // 创建缓冲流处理上下文
-    let mut ctx = BufferedStreamContext::new(
-        model,
-        fallback_input_tokens,
+    let stream = create_deferred_buffered_sse_stream(
+        provider,
+        request_body.to_string(),
+        model.to_string(),
         thinking_enabled,
         tool_name_map,
+        hook,
+        fallback_input_tokens,
+        cache_plan,
+        tracer,
     );
-    ctx.set_cache_usage(cache_usage);
-
-    // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1600,19 +1749,82 @@ async fn handle_stream_request_buffered(
         .unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn create_deferred_buffered_sse_stream(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    model: String,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    hook: UsageRecordHook,
+    fallback_input_tokens: i32,
+    cache_plan: CacheUsagePlan,
+    tracer: std::sync::Arc<RequestTracer>,
+) -> ByteStream {
+    // Buffered `/cc` streams also avoid pre-upstream placeholder bytes. A ping is
+    // emitted only after the first real upstream body chunk has been read.
+    let upstream = stream::once(async move {
+        let call_result = match provider
+            .call_api_stream(&request_body, Some(tracer.as_ref()))
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+                tracer.finalize(
+                    "error",
+                    last_attempt_outcome(&tracer),
+                    Some(&e.to_string()),
+                    None,
+                );
+                let (_, error_type, message) = provider_error_status_and_detail(&e);
+                return Box::pin(stream::iter(vec![Ok(create_error_sse(
+                    error_type, message,
+                ))])) as ByteStream;
+            }
+        };
+
+        let response = call_result.response;
+        let credential_id = call_result.credential_id;
+
+        let mut ctx = BufferedStreamContext::new(
+            model,
+            fallback_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+        );
+        ctx.set_cache_usage(cache_plan.usage());
+
+        Box::pin(create_buffered_sse_stream(
+            response,
+            ctx,
+            hook,
+            credential_id,
+            tracer,
+            cache_plan,
+        )) as ByteStream
+    })
+    .flatten();
+
+    Box::pin(upstream)
+}
+
 /// 创建缓冲 SSE 事件流
 ///
 /// 工作流程：
-/// 1. 先发送 Anthropic 初始事件，避免下游把 TTFB 记到上游结束时
-/// 2. 等待上游流完成，期间只发送 ping 保活信号
-/// 3. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 4. 流结束后，一次性发送剩余事件；工具 JSON 只在完整解析后发送
+/// 1. 等待上游首个真实 body chunk 后发送 ping 标记首包，随后只发送 ping 保活信号
+/// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
+/// 3. 流结束后，一次性发送剩余事件；工具 JSON 只在完整解析后发送
+///
+/// 注意：这里不能提前发送 `message_start`。`/cc/v1/messages` 的目的就是等待
+/// `contextUsageEvent` 后修正首包 usage；首包一旦发出就无法再修改。
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
+    cache_plan: CacheUsagePlan,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1622,39 +1834,17 @@ fn create_buffered_sse_stream(
             ctx,
             EventStreamDecoder::new(),
             false,
-            false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
+            false,
             hook,
             credential_id,
             tracer,
             0u64,
+            cache_plan,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, initial_events_sent, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, mut first_upstream_chunk_seen, hook, credential_id, tracer, mut sent_bytes, cache_plan)| async move {
             if finished {
                 return None;
-            }
-
-            if !initial_events_sent {
-                let bytes: Vec<Result<Bytes, Infallible>> = ctx
-                    .take_initial_events_for_stream_start()
-                    .into_iter()
-                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                    .collect();
-                return Some((
-                    stream::iter(bytes),
-                    (
-                        body_stream,
-                        ctx,
-                        decoder,
-                        false,
-                        true,
-                        ping_interval,
-                        hook,
-                        credential_id,
-                        tracer,
-                        sent_bytes,
-                    ),
-                ));
             }
 
             loop {
@@ -1664,10 +1854,10 @@ fn create_buffered_sse_stream(
                     biased;
 
                     // 优先检查 ping 保活（等待期间唯一发送的数据）
-                    _ = ping_interval.tick() => {
+                    _ = ping_interval.tick(), if first_upstream_chunk_seen => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, initial_events_sent, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_upstream_chunk_seen, hook, credential_id, tracer, sent_bytes, cache_plan)));
                     }
 
                     // 然后处理数据流
@@ -1693,6 +1883,12 @@ fn create_buffered_sse_stream(
                                         }
                                     }
                                 }
+                                if !first_upstream_chunk_seen {
+                                    first_upstream_chunk_seen = true;
+                                    ping_interval.reset();
+                                    let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, first_upstream_chunk_seen, hook, credential_id, tracer, sent_bytes, cache_plan)));
+                                }
                                 // 继续读取下一个 chunk，不发送任何数据
                             }
                             Some(Err(e)) => {
@@ -1713,7 +1909,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, initial_events_sent, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_upstream_chunk_seen, hook, credential_id, tracer, sent_bytes, cache_plan)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
@@ -1725,6 +1921,7 @@ fn create_buffered_sse_stream(
                                     tracer.finalize("error", Some(outcome::BAD_REQUEST), Some(&message), None);
                                 } else {
                                     hook.record(credential_id, i, o, cc, cr, credits, "success");
+                                    cache_plan.commit_success();
                                     tracer.set_usage(i, o, cc, cr);
                                     tracer.finalize("success", None, None, None);
                                 }
@@ -1732,7 +1929,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, initial_events_sent, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, first_upstream_chunk_seen, hook, credential_id, tracer, sent_bytes, cache_plan)));
                             }
                         }
                     }
@@ -1826,6 +2023,30 @@ mod tests {
     }
 
     #[test]
+    fn count_image_budget_includes_tool_result_images() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(
+            r#"{
+            "model": "claude-opus-4-7",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "u1", "content": [
+                        {"type": "text", "text": "screenshot"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAABBBBCCCC"}}
+                    ]}
+                ]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let stats = count_image_budget(&req);
+        assert_eq!(stats.count, 1);
+        assert_eq!(stats.total_b64_bytes, 12);
+        assert_eq!(stats.largest_b64_bytes, 12);
+    }
+
+    #[test]
     fn count_image_budget_skips_url_only_images() {
         let req: super::super::types::MessagesRequest = serde_json::from_str(
             r#"{
@@ -1842,6 +2063,17 @@ mod tests {
         .unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
+    }
+
+    #[test]
+    fn request_image_budget_limits_reject_count_and_total() {
+        let limits = RequestImageLimits {
+            max_count: 1,
+            max_total_base64_bytes: 12,
+        };
+        assert!(limits.validate(2, 8).is_err());
+        assert!(limits.validate(1, 13).is_err());
+        assert!(limits.validate(1, 12).is_ok());
     }
 
     #[test]

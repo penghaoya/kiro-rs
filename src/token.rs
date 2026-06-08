@@ -13,6 +13,9 @@ use crate::anthropic::types::{
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use std::sync::OnceLock;
+use std::time::Duration;
+
+const REMOTE_COUNT_TOKENS_TIMEOUT_SECS: u64 = 5;
 
 /// Count Tokens API 配置
 #[derive(Clone, Default)]
@@ -115,10 +118,29 @@ pub(crate) fn count_all_tokens(
     if let Some(config) = get_config() {
         if let Some(api_url) = &config.api_url {
             // 尝试调用远程 API
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(call_remote_count_tokens(
-                    api_url, config, model, &system, &messages, &tools,
-                ))
+            let result = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                                Box::new(e)
+                            })?
+                            .block_on(async {
+                                tokio::time::timeout(
+                                    Duration::from_secs(REMOTE_COUNT_TOKENS_TIMEOUT_SECS),
+                                    call_remote_count_tokens(
+                                        api_url, config, model, &system, &messages, &tools,
+                                    ),
+                                )
+                                .await
+                                .map_err(|_| "remote count_tokens timeout".into())
+                                .and_then(|r| r)
+                            })
+                    })
+                    .join()
+                    .unwrap_or_else(|_| Err("remote count_tokens worker panicked".into()))
             });
 
             match result {
@@ -204,9 +226,7 @@ fn count_all_tokens_local(
             total += count_tokens(s);
         } else if let serde_json::Value::Array(arr) = &msg.content {
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    total += count_tokens(text);
-                }
+                total += anthropic_content_block_token_estimate(item);
             }
         }
     }
@@ -224,27 +244,66 @@ fn count_all_tokens_local(
     total.max(1)
 }
 
+pub(crate) fn anthropic_content_block_token_estimate(block: &serde_json::Value) -> u64 {
+    match block.get("type").and_then(|v| v.as_str()) {
+        Some("text") => block
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(count_tokens)
+            .unwrap_or(0),
+        Some("thinking") => block
+            .get("thinking")
+            .and_then(|v| v.as_str())
+            .map(count_tokens)
+            .unwrap_or(0),
+        Some("redacted_thinking") => 8,
+        Some("tool_use") => {
+            let mut total = block
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(count_tokens)
+                .unwrap_or(0);
+            if let Some(input) = block.get("input") {
+                total += count_tokens(&serde_json::to_string(input).unwrap_or_default());
+            }
+            total
+        }
+        Some("tool_result") => block
+            .get("content")
+            .map(anthropic_content_value_token_estimate)
+            .unwrap_or(0),
+        Some("image") => {
+            let source = block.get("source");
+            let media_type = source
+                .and_then(|s| s.get("media_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let data = source
+                .and_then(|s| s.get("data"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            crate::image_resize::estimate_image_tokens(media_type, data) as u64
+        }
+        _ => count_tokens(&serde_json::to_string(block).unwrap_or_default()),
+    }
+}
+
+fn anthropic_content_value_token_estimate(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::String(s) => count_tokens(s),
+        serde_json::Value::Array(arr) => {
+            arr.iter().map(anthropic_content_block_token_estimate).sum()
+        }
+        _ => count_tokens(&serde_json::to_string(value).unwrap_or_default()),
+    }
+}
+
 /// 估算输出 tokens
 pub(crate) fn estimate_output_tokens(content: &[serde_json::Value]) -> i32 {
     let mut total = 0;
 
     for block in content {
-        if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-            total += count_tokens(text) as i32;
-        }
-        if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
-            total += count_tokens(thinking) as i32;
-        }
-        if block.get("type").and_then(|v| v.as_str()) == Some("redacted_thinking") {
-            total += 8;
-        }
-        if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-            // 工具调用开销
-            if let Some(input) = block.get("input") {
-                let input_str = serde_json::to_string(input).unwrap_or_default();
-                total += count_tokens(&input_str) as i32;
-            }
-        }
+        total += anthropic_content_block_token_estimate(block) as i32;
     }
 
     total.max(1)
@@ -277,5 +336,31 @@ mod tests {
         })]);
 
         assert!(tokens >= 8);
+    }
+
+    #[test]
+    fn token_count_includes_tool_use_input_tool_result_images_and_reasoning() {
+        let tool_use = anthropic_content_block_token_estimate(&json!({
+            "type": "tool_use",
+            "name": "run",
+            "input": {"cmd": "cat very_long_file.txt", "limit": 2000}
+        }));
+        let tool_result = anthropic_content_block_token_estimate(&json!({
+            "type": "tool_result",
+            "content": "result line ".repeat(200)
+        }));
+        let thinking = anthropic_content_block_token_estimate(&json!({
+            "type": "thinking",
+            "thinking": "reasoning ".repeat(100)
+        }));
+        let image = anthropic_content_block_token_estimate(&json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": ""}
+        }));
+
+        assert!(tool_use > 0);
+        assert!(tool_result > 10);
+        assert!(thinking > 10);
+        assert!(image > 0);
     }
 }

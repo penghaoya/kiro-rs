@@ -18,8 +18,10 @@ use super::converter::restore_tool_use_for_client;
 /// 否则 SDK / 服务端会拒绝请求并报：
 /// `The content[].thinking in the thinking mode must be passed back to the API`。
 ///
-/// 上游 Kiro 不下发真实签名（它本身不是 Anthropic 服务端），因此 kiro.rs 在
-/// thinking 块结束时插入一个非空占位字符串以满足客户端本地校验。
+/// 上游 Kiro 可能下发自己的 reasoning signature，但它不是 Anthropic thinking
+/// signature；向下游透传会让 CCH 等客户端误按 Anthropic protobuf 解码出 Kiro
+/// 内部模型代号。因此 kiro.rs 在 thinking 块结束时只插入一个非空占位字符串，
+/// 满足客户端本地校验即可。
 /// converter 在解析 assistant 消息回传 Kiro 时只读 `block.thinking`，不读
 /// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
 pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
@@ -176,7 +178,7 @@ fn is_quote_char(buffer: &str, pos: usize) -> bool {
 /// # 返回值
 /// - `Some(pos)`: 真正的结束标签的起始位置
 /// - `None`: 没有找到真正的结束标签
-fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
+fn find_real_thinking_end_tag_with_boundary(buffer: &str) -> Option<(usize, usize)> {
     const TAG: &str = "</thinking>";
     let mut search_start = 0;
 
@@ -199,21 +201,35 @@ fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
         // 检查后面的内容
         let after_content = &buffer[after_pos..];
 
-        // 如果标签后面内容不足以判断是否有双换行符，等待更多内容
-        if after_content.len() < 2 {
-            return None;
+        if after_content.is_empty() {
+            return Some((absolute_pos, after_pos));
         }
-
-        // 真正的 thinking 结束标签后面会有双换行符 `\n\n`
+        if after_content.trim().is_empty() {
+            return Some((absolute_pos, buffer.len()));
+        }
+        if after_content.starts_with("\r\n\r\n") {
+            return Some((absolute_pos, after_pos + 4));
+        }
         if after_content.starts_with("\n\n") {
-            return Some(absolute_pos);
+            return Some((absolute_pos, after_pos + 2));
+        }
+        if after_content.starts_with("\r\n") {
+            return Some((absolute_pos, after_pos + 2));
+        }
+        if after_content.starts_with('\n') {
+            return Some((absolute_pos, after_pos + 1));
         }
 
-        // 不是双换行符，跳过继续搜索
-        search_start = absolute_pos + 1;
+        // 标签后直接接正文也应关闭 thinking，并把后续正文作为普通 text 继续处理。
+        return Some((absolute_pos, after_pos));
     }
 
     None
+}
+
+#[cfg(test)]
+fn find_real_thinking_end_tag(buffer: &str) -> Option<usize> {
+    find_real_thinking_end_tag_with_boundary(buffer).map(|(pos, _)| pos)
 }
 
 /// 查找缓冲区末尾的 thinking 结束标签（允许末尾只有空白字符）
@@ -300,18 +316,16 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     let after_open = &text[start_pos + "<thinking>".len()..];
 
     // 查找结束标签：优先匹配带 \n\n 后缀的，退而使用末尾匹配
-    let (thinking_raw, text_after) = if let Some(end_pos) = find_real_thinking_end_tag(after_open) {
-        (
-            &after_open[..end_pos],
-            &after_open[end_pos + "</thinking>\n\n".len()..],
-        )
-    } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
-        let after_tag = end_pos + "</thinking>".len();
-        (&after_open[..end_pos], after_open[after_tag..].trim_start())
-    } else {
-        // 找不到有效的结束标签，不做提取
-        return (None, text.to_string());
-    };
+    let (thinking_raw, text_after) =
+        if let Some((end_pos, after_tag)) = find_real_thinking_end_tag_with_boundary(after_open) {
+            (&after_open[..end_pos], &after_open[after_tag..])
+        } else if let Some(end_pos) = find_real_thinking_end_tag_at_buffer_end(after_open) {
+            let after_tag = end_pos + "</thinking>".len();
+            (&after_open[..end_pos], after_open[after_tag..].trim_start())
+        } else {
+            // 找不到有效的结束标签，不做提取
+            return (None, text.to_string());
+        };
 
     // 剥离开头的换行符（与流式处理一致：模型输出 <thinking>\n）
     let thinking_content = thinking_raw.strip_prefix('\n').unwrap_or(thinking_raw);
@@ -777,13 +791,13 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 是否存在由 reasoningContentEvent 打开的 thinking 块
     pub reasoning_block_open: bool,
-    /// reasoningContentEvent 携带的上游签名
-    pub pending_reasoning_signature: Option<String>,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// thinking 结束后，下一段正文开头的协议分隔空白需要剥离一次。
+    strip_text_after_thinking_boundary: bool,
     /// 中转层 CacheMeter 的缓存覆盖情况（estimate 口径）。最终上报时按真实 total
     /// 做互斥分摊：`input + cache_creation + cache_read == total`。
     pub cache_usage: super::cache_metering::CacheUsage,
@@ -825,9 +839,9 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             reasoning_block_open: false,
-            pending_reasoning_signature: None,
             text_block_index: None,
             strip_thinking_leading_newline: false,
+            strip_text_after_thinking_boundary: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
             credits: 0.0,
             tool_json_accumulator: ToolJsonAccumulator::new(),
@@ -1062,7 +1076,9 @@ impl StreamContext {
                 }
 
                 // 在 thinking 块内，查找 </thinking> 结束标签（跳过被反引号包裹的）
-                if let Some(end_pos) = find_real_thinking_end_tag(&self.thinking_buffer) {
+                if let Some((end_pos, after_tag)) =
+                    find_real_thinking_end_tag_with_boundary(&self.thinking_buffer)
+                {
                     // 提取 thinking 内容
                     let thinking_content = self.thinking_buffer[..end_pos].to_string();
                     if !thinking_content.is_empty() {
@@ -1076,6 +1092,7 @@ impl StreamContext {
                     // 结束 thinking 块
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
+                    self.strip_text_after_thinking_boundary = true;
 
                     // 发送空的 thinking_delta 事件，然后发送 content_block_stop 事件
                     if let Some(thinking_index) = self.thinking_block_index {
@@ -1091,20 +1108,17 @@ impl StreamContext {
                         }
                     }
 
-                    // 剥离 `</thinking>\n\n`（find_real_thinking_end_tag 已确认 \n\n 存在）
-                    self.thinking_buffer =
-                        self.thinking_buffer[end_pos + "</thinking>\n\n".len()..].to_string();
+                    self.thinking_buffer = self.thinking_buffer[after_tag..].to_string();
                 } else {
                     // 没有找到结束标签，发送当前缓冲区内容作为 thinking_delta。
-                    // 保留末尾可能是部分 `</thinking>\n\n` 的内容：
-                    // find_real_thinking_end_tag 要求标签后有 `\n\n` 才返回 Some，
-                    // 因此保留区必须覆盖 `</thinking>\n\n` 的完整长度（13 字节），
+                    // 保留末尾可能是部分 `</thinking>` 的内容：
+                    // 因此保留区必须覆盖 `</thinking>` 的完整长度，
                     // 否则当 `</thinking>` 已在 buffer 但 `\n\n` 尚未到达时，
                     // 标签的前几个字符会被错误地作为 thinking_delta 发出。
                     let target_len = self
                         .thinking_buffer
                         .len()
-                        .saturating_sub("</thinking>\n\n".len());
+                        .saturating_sub("</thinking>".len());
                     let safe_len = find_char_boundary(&self.thinking_buffer, target_len);
                     if safe_len > 0 {
                         let safe_content = self.thinking_buffer[..safe_len].to_string();
@@ -1122,9 +1136,19 @@ impl StreamContext {
             } else {
                 // thinking 已提取完成，剩余内容作为 text_delta
                 if !self.thinking_buffer.is_empty() {
-                    let remaining = self.thinking_buffer.clone();
+                    let remaining = if self.strip_text_after_thinking_boundary {
+                        let trimmed = self.thinking_buffer.trim_start().to_string();
+                        if !trimmed.is_empty() {
+                            self.strip_text_after_thinking_boundary = false;
+                        }
+                        trimmed
+                    } else {
+                        self.thinking_buffer.clone()
+                    };
                     self.thinking_buffer.clear();
-                    events.extend(self.create_text_delta_events(&remaining));
+                    if !remaining.is_empty() {
+                        events.extend(self.create_text_delta_events(&remaining));
+                    }
                 }
                 break;
             }
@@ -1215,14 +1239,10 @@ impl StreamContext {
     /// assistant 消息回传时本地校验 thinking 块必须带非空 signature，否则抛出
     /// `The content[].thinking in the thinking mode must be passed back to the API`。
     ///
-    /// 上游 Kiro 不是 Anthropic 服务端，不会下发真实签名，因此这里发一个非空
-    /// 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro 的逻辑
-    /// （converter 只读 `block.thinking`，不读 signature）。
+    /// 上游 Kiro 的 reasoning signature 不是 Anthropic thinking signature，不能
+    /// 透传给下游；否则 CCH 会尝试按 Anthropic protobuf 解码并误识别模型。
+    /// 因此这里始终发本地占位字符串。该字段不参与转发回 Kiro 的逻辑。
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
-        self.create_signature_delta_event_with_signature(index, THINKING_SIGNATURE_PLACEHOLDER)
-    }
-
-    fn create_signature_delta_event_with_signature(&self, index: i32, signature: &str) -> SseEvent {
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -1230,7 +1250,7 @@ impl StreamContext {
                 "index": index,
                 "delta": {
                     "type": "signature_delta",
-                    "signature": signature,
+                    "signature": THINKING_SIGNATURE_PLACEHOLDER,
                 }
             }),
         )
@@ -1255,6 +1275,10 @@ impl StreamContext {
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
         if !self.thinking_enabled {
+            // Kiro may emit reasoningContentEvent even when the downstream client
+            // did not request Anthropic thinking blocks. Treat it as hidden
+            // reasoning, not assistant text, otherwise model internals leak into
+            // Claude Code's visible response.
             return Vec::new();
         }
 
@@ -1316,10 +1340,6 @@ impl StreamContext {
             events.extend(start_events);
         }
 
-        if let Some(signature) = reasoning.signature.as_ref().filter(|s| !s.is_empty()) {
-            self.pending_reasoning_signature = Some(signature.clone());
-        }
-
         let text = reasoning.text.as_str();
         if !text.is_empty() {
             self.output_tokens += estimate_tokens(text);
@@ -1339,20 +1359,13 @@ impl StreamContext {
         let mut events = Vec::new();
         if let Some(thinking_index) = self.thinking_block_index {
             events.push(self.create_thinking_delta_event(thinking_index, ""));
-            let signature = self
-                .pending_reasoning_signature
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(THINKING_SIGNATURE_PLACEHOLDER);
-            events
-                .push(self.create_signature_delta_event_with_signature(thinking_index, signature));
+            events.push(self.create_signature_delta_event(thinking_index));
             if let Some(stop_event) = self.state_manager.handle_content_block_stop(thinking_index) {
                 events.push(stop_event);
             }
         }
 
         self.reasoning_block_open = false;
-        self.pending_reasoning_signature = None;
         self.thinking_extracted = true;
         events
     }
@@ -1384,6 +1397,7 @@ impl StreamContext {
                 // 结束 thinking 块
                 self.in_thinking_block = false;
                 self.thinking_extracted = true;
+                self.strip_text_after_thinking_boundary = true;
 
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
@@ -1565,6 +1579,7 @@ impl StreamContext {
                     self.thinking_buffer.clear();
                     self.in_thinking_block = false;
                     self.thinking_extracted = true;
+                    self.strip_text_after_thinking_boundary = true;
                     if !remaining.is_empty() {
                         events.extend(self.create_text_delta_events(&remaining));
                     }
@@ -1591,8 +1606,18 @@ impl StreamContext {
                 }
             } else {
                 // 否则发送剩余内容作为 text_delta
-                let buffer_content = self.thinking_buffer.clone();
-                events.extend(self.create_text_delta_events(&buffer_content));
+                let buffer_content = if self.strip_text_after_thinking_boundary {
+                    let trimmed = self.thinking_buffer.trim_start().to_string();
+                    if !trimmed.is_empty() {
+                        self.strip_text_after_thinking_boundary = false;
+                    }
+                    trimmed
+                } else {
+                    self.thinking_buffer.clone()
+                };
+                if !buffer_content.is_empty() {
+                    events.extend(self.create_text_delta_events(&buffer_content));
+                }
             }
             self.thinking_buffer.clear();
         }
@@ -1668,18 +1693,6 @@ impl BufferedStreamContext {
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
-    }
-
-    /// 提前生成并取走初始事件，用于 buffered SSE 在读取完整上游前先发首包。
-    ///
-    /// 这里不会包含 tool_use 输入，因此仍然保留半截 JSON 的缓冲保护。
-    pub fn take_initial_events_for_stream_start(&mut self) -> Vec<SseEvent> {
-        if self.initial_events_generated {
-            return Vec::new();
-        }
-
-        self.initial_events_generated = true;
-        self.inner.generate_initial_events()
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -1821,7 +1834,7 @@ mod tests {
     }
 
     #[test]
-    fn test_buffered_context_can_emit_initial_events_before_final_flush() {
+    fn cc_v1_message_start_waits_for_context_usage_event() {
         let mut ctx = BufferedStreamContext::new("test-model", 100, false, HashMap::new());
         ctx.set_cache_usage(crate::anthropic::cache_metering::CacheUsage {
             cache_read: 25,
@@ -1829,37 +1842,39 @@ mod tests {
             prompt_total_est: 100,
         });
 
-        let initial = ctx.take_initial_events_for_stream_start();
-        assert_eq!(
-            initial
-                .iter()
-                .filter(|e| e.event == "message_start")
-                .count(),
-            1,
-            "initial stream start should contain exactly one message_start"
-        );
-        assert!(
-            ctx.take_initial_events_for_stream_start().is_empty(),
-            "initial events should only be emitted once"
-        );
-
         ctx.process_and_buffer(&Event::AssistantResponse(
             serde_json::from_value(serde_json::json!({"content": "hello"})).unwrap(),
         ));
+        ctx.process_and_buffer(&Event::ContextUsage(
+            serde_json::from_value(serde_json::json!({"contextUsagePercentage": 50.0})).unwrap(),
+        ));
         let final_events = ctx.finish_and_get_all_events();
 
-        assert!(
-            final_events.iter().all(|e| e.event != "message_start"),
-            "final buffered flush must not replay message_start after it was sent early"
+        let message_start = final_events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("final buffered flush should include message_start");
+        let start_usage = &message_start.data["message"]["usage"];
+        assert_ne!(
+            start_usage["input_tokens"],
+            json!(30),
+            "message_start must not use provisional fallback usage"
         );
         let message_delta = final_events
             .iter()
             .find(|e| e.event == "message_delta")
             .expect("should have message_delta event");
         let usage = &message_delta.data["usage"];
-        assert_eq!(usage["input_tokens"], json!(30));
-        assert_eq!(usage["cache_creation_input_tokens"], json!(45));
-        assert_eq!(usage["cache_read_input_tokens"], json!(25));
+        for key in [
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ] {
+            assert_eq!(
+                start_usage[key], usage[key],
+                "{key} must match between message_start and message_delta after context usage is known"
+            );
+        }
     }
 
     #[test]
@@ -2485,10 +2500,11 @@ mod tests {
             Some(9)
         );
 
-        // 没有双换行符的情况
-        assert_eq!(find_real_thinking_end_tag("</thinking>"), None);
-        assert_eq!(find_real_thinking_end_tag("</thinking>\n"), None);
-        assert_eq!(find_real_thinking_end_tag("</thinking> more"), None);
+        // 兼容 EOF、单换行和直接接正文
+        assert_eq!(find_real_thinking_end_tag("</thinking>"), Some(0));
+        assert_eq!(find_real_thinking_end_tag("</thinking>\n"), Some(0));
+        assert_eq!(find_real_thinking_end_tag("</thinking>\r\n"), Some(0));
+        assert_eq!(find_real_thinking_end_tag("</thinking> more"), Some(0));
     }
 
     #[test]
@@ -2649,7 +2665,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_content_event_emits_thinking_block_with_upstream_signature() {
+    fn test_reasoning_content_event_emits_thinking_block_with_placeholder_signature() {
         let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
         let mut all = ctx.generate_initial_events();
 
@@ -2680,7 +2696,7 @@ mod tests {
         assert_eq!(collect_text_content(&all), "answer");
         assert_eq!(
             signature.unwrap().data["delta"]["signature"].as_str(),
-            Some("sig-upstream")
+            Some(THINKING_SIGNATURE_PLACEHOLDER)
         );
     }
 
@@ -2714,6 +2730,30 @@ mod tests {
         assert_eq!(
             start.data["content_block"]["data"].as_str(),
             Some("encrypted-thinking")
+        );
+    }
+
+    #[test]
+    fn thinking_disabled_drops_reasoning_text() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut all = ctx.generate_initial_events();
+
+        all.extend(
+            ctx.process_kiro_event(&Event::ReasoningContent(
+                serde_json::from_value(serde_json::json!({
+                    "text": "visible reasoning",
+                    "signature": "sig-secret"
+                }))
+                .unwrap(),
+            )),
+        );
+        all.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&all), "");
+        assert!(
+            all.iter()
+                .all(|e| e.data["delta"]["type"] != "signature_delta"),
+            "disabled thinking must not leak reasoning signatures"
         );
     }
 
@@ -2876,6 +2916,28 @@ mod tests {
             full_text
         );
         assert_eq!(full_text, "你好");
+    }
+
+    #[test]
+    fn thinking_end_tag_accepts_eof_lf_crlf_whitespace_and_inline_text() {
+        for (input, expected_text) in [
+            ("<thinking>abc</thinking>", ""),
+            ("<thinking>abc</thinking>\n正文", "正文"),
+            ("<thinking>abc</thinking>\r\n正文", "正文"),
+            ("<thinking>abc</thinking>正文", "正文"),
+            ("<thinking>abc</thinking>   \n正文", "正文"),
+        ] {
+            let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+            let _ = ctx.generate_initial_events();
+            let mut all = ctx.process_assistant_response(input);
+            all.extend(ctx.generate_final_events());
+            assert_eq!(collect_thinking_content(&all), "abc", "input={input:?}");
+            assert_eq!(
+                collect_text_content(&all).trim(),
+                expected_text,
+                "input={input:?}"
+            );
+        }
     }
 
     /// 辅助函数：从事件列表中提取所有 thinking_delta 的拼接内容

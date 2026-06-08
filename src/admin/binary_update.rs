@@ -23,7 +23,30 @@ use crate::admin::error::AdminServiceError;
 const MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
 /// GitHub Releases 仓库 owner/repo。
-const GITHUB_REPO: &str = "ZyphrZero/kiro.rs";
+const GITHUB_REPO: &str = "GreyGunG/Kiro-RS-Tool";
+const ALLOW_UNSIGNED_UPDATE_ENV: &str = "KIRO_RS_ALLOW_UNSIGNED_UPDATE";
+
+/// Online update currently verifies only release SHA256SUMS, not a detached
+/// signature rooted in a trusted public key. Keep it disabled unless the
+/// operator explicitly opts into unsigned update risk.
+pub fn ensure_unsigned_update_allowed() -> Result<(), AdminServiceError> {
+    let allowed = std::env::var(ALLOW_UNSIGNED_UPDATE_ENV)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if allowed {
+        return Ok(());
+    }
+    Err(AdminServiceError::InternalError(format!(
+        "在线更新默认禁用：release 缺少签名验证。确认信任更新源后设置 {}=1 再重试。",
+        ALLOW_UNSIGNED_UPDATE_ENV
+    )))
+}
 
 /// release 包内（解压后）二进制文件名。Linux/macOS 是 `kiro-rs`，
 /// Windows 是 `kiro-rs.exe`。
@@ -456,4 +479,31 @@ pub fn schedule_self_exit(delay: std::time::Duration) {
         let _ = std::io::stdout().flush();
         std::process::exit(0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn unsigned_update_is_disabled_by_default_and_requires_opt_in() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::remove_var(ALLOW_UNSIGNED_UPDATE_ENV);
+        }
+        assert!(ensure_unsigned_update_allowed().is_err());
+        unsafe {
+            std::env::set_var(ALLOW_UNSIGNED_UPDATE_ENV, "1");
+        }
+        assert!(ensure_unsigned_update_allowed().is_ok());
+        unsafe {
+            std::env::remove_var(ALLOW_UNSIGNED_UPDATE_ENV);
+        }
+    }
 }

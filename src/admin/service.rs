@@ -23,8 +23,8 @@ use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
     BatchAddProxyRequest, CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse,
-    EnableOverageAllResult, GitHubRateLimitInfo, ImageUpdateResponse, KamExportAccount,
-    KamExportResponse, GlobalConfigResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
+    EnableOverageAllResult, GitHubRateLimitInfo, GlobalConfigResponse, ImageUpdateResponse,
+    KamExportAccount, KamExportResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, RetryPolicyResponse, SetAccountThrottleConfigRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetRetryPolicyRequest,
@@ -386,7 +386,7 @@ fn credential_to_kam_account(cred: KiroCredentials) -> Option<KamExportAccount> 
 
 /// GitHub Release 仓库名（owner/repo）。
 /// 在线更新所需的版本号、changelog、二进制资产都从这里取。
-const GITHUB_RELEASES_REPO: &str = "ZyphrZero/kiro.rs";
+const GITHUB_RELEASES_REPO: &str = "GreyGunG/Kiro-RS-Tool";
 
 impl AdminService {
     pub fn new(
@@ -1066,11 +1066,7 @@ impl AdminService {
     }
 
     /// 设置单个凭据的 endpoint。
-    pub fn set_endpoint(
-        &self,
-        id: u64,
-        endpoint: Option<String>,
-    ) -> Result<(), AdminServiceError> {
+    pub fn set_endpoint(&self, id: u64, endpoint: Option<String>) -> Result<(), AdminServiceError> {
         let endpoint = endpoint.and_then(|value| {
             let trimmed = value.trim();
             if trimmed.is_empty() {
@@ -1205,7 +1201,8 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         self.token_manager.update_global_config_runtime(cfg.clone());
-        self.token_manager.set_global_proxy(cfg.proxy_url.as_deref().map(ProxyConfig::new));
+        self.token_manager
+            .set_global_proxy(cfg.proxy_url.as_deref().map(ProxyConfig::new));
 
         if endpoint_changed {
             if let Some(provider) = &self.kiro_provider
@@ -1219,7 +1216,8 @@ impl AdminService {
         }
         if proxy_changed {
             if let Some(provider) = &self.kiro_provider
-                && let Err(e) = provider.update_global_proxy(cfg.proxy_url.as_deref().map(ProxyConfig::new))
+                && let Err(e) =
+                    provider.update_global_proxy(cfg.proxy_url.as_deref().map(ProxyConfig::new))
             {
                 return Err(AdminServiceError::InternalError(format!(
                     "热更新全局代理失败: {}",
@@ -1314,6 +1312,7 @@ impl AdminService {
     /// 不替换当前可执行文件，便于用户在正式应用前先确认下载成功。
     /// 下载产物保存到 `<exe>.staged-<version>`，下次 apply 命中同版本时复用。
     pub async fn pull_update_image(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
+        super::binary_update::ensure_unsigned_update_allowed()?;
         let (proxy, token) = {
             let runtime = self.update_config.lock();
             (
@@ -1362,6 +1361,7 @@ impl AdminService {
     /// `restart: unless-stopped` 接管重启（对应前端「更新并重启」按钮）。
     /// 若 pull 已经把目标版本下载到 `<exe>.staged-<version>`，跳过重复下载。
     pub async fn apply_image_update(&self) -> Result<ImageUpdateResponse, AdminServiceError> {
+        super::binary_update::ensure_unsigned_update_allowed()?;
         let (proxy, token) = {
             let runtime = self.update_config.lock();
             (
