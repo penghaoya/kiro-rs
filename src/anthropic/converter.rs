@@ -181,9 +181,7 @@ pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
     if model_lower.contains("sonnet") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-sonnet-4.8".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
+        if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-sonnet-4.6".to_string())
         } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
             Some("claude-sonnet-4.5".to_string())
@@ -218,7 +216,6 @@ pub fn get_context_window_size(model: &str) -> i32 {
     match map_model(model) {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-sonnet-4.8"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8" =>
@@ -1733,16 +1730,10 @@ mod tests {
     }
 
     #[test]
-    fn test_map_model_sonnet_4_8() {
-        assert_eq!(
-            map_model("claude-sonnet-4-8"),
-            Some("claude-sonnet-4.8".to_string())
-        );
-        assert_eq!(
-            map_model("claude-sonnet-4.8-thinking"),
-            Some("claude-sonnet-4.8".to_string())
-        );
-        assert_eq!(get_context_window_size("claude-sonnet-4-8"), 1_000_000);
+    fn test_map_model_rejects_sonnet_4_8() {
+        assert_eq!(map_model("claude-sonnet-4-8"), None);
+        assert_eq!(map_model("claude-sonnet-4.8-thinking"), None);
+        assert_eq!(get_context_window_size("claude-sonnet-4-8"), 200_000);
     }
 
     #[test]
@@ -1821,14 +1812,12 @@ mod tests {
     }
 
     #[test]
-    fn test_output_config_does_not_emit_unsupported_additional_fields() {
+    fn test_output_config_rejects_unsupported_sonnet_4_8() {
         let req = minimal_request_with_output_config("claude-sonnet-4-8-thinking");
-        let result = convert_request(&req).unwrap();
-
-        assert!(
-            result.additional_model_request_fields.is_none(),
-            "sonnet 4.8 is not in the 2026-06-07 ListAvailableModels schema for this account"
-        );
+        assert!(matches!(
+            convert_request(&req),
+            Err(ConversionError::UnsupportedModel(model)) if model == "claude-sonnet-4-8-thinking"
+        ));
     }
 
     #[test]

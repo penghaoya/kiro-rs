@@ -838,6 +838,9 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let (input_tokens, cache_creation_input_tokens, cache_read_input_tokens) =
+            self.cache_usage.split_against_total(self.input_tokens);
+
         json!({
             "type": "message_start",
             "message": {
@@ -849,10 +852,10 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": input_tokens,
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation_input_tokens,
+                    "cache_read_input_tokens": cache_read_input_tokens
                 }
             }
         })
@@ -1786,6 +1789,23 @@ mod tests {
         // 第二次应该被跳过
         let event = manager.handle_message_start(json!({"type": "message_start"}));
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn test_message_start_includes_provisional_cache_usage() {
+        let mut ctx = StreamContext::new_with_thinking("test-model", 100, false, HashMap::new());
+        ctx.cache_usage = crate::anthropic::cache_metering::CacheUsage {
+            cache_read: 30,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+        };
+
+        let event = ctx.create_message_start_event();
+        let usage = &event["message"]["usage"];
+
+        assert_eq!(usage["input_tokens"], json!(20));
+        assert_eq!(usage["cache_creation_input_tokens"], json!(50));
+        assert_eq!(usage["cache_read_input_tokens"], json!(30));
     }
 
     #[test]
