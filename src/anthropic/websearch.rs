@@ -238,9 +238,18 @@ pub fn create_websearch_sse_stream(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    );
 
     stream::iter(
         events
@@ -256,6 +265,8 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
@@ -278,8 +289,8 @@ fn generate_websearch_events(
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation_tokens,
+                    "cache_read_input_tokens": cache_read_tokens
                 }
             }
         }),
@@ -444,6 +455,8 @@ fn generate_websearch_events(
             },
             "usage": {
                 "output_tokens": output_tokens,
+                "cache_creation_input_tokens": cache_creation_tokens,
+                "cache_read_input_tokens": cache_read_tokens,
                 "server_tool_use": {
                     "web_search_requests": 1
                 }
@@ -493,6 +506,8 @@ pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
@@ -525,8 +540,15 @@ pub async fn handle_websearch_request(
 
     // 4. 生成 SSE 响应
     let model = payload.model.clone();
-    let stream =
-        create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+    let stream = create_websearch_sse_stream(
+        model,
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    );
 
     Response::builder()
         .status(StatusCode::OK)
@@ -813,5 +835,41 @@ mod tests {
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));
         assert!(summary.contains("This is a test snippet"));
+    }
+
+    #[test]
+    fn websearch_events_include_cache_usage_in_start_and_delta() {
+        let events = generate_websearch_events(
+            "claude-opus-4-8",
+            "kiro cache fields",
+            "srvtoolu_test",
+            None,
+            123,
+            45,
+            67,
+        );
+
+        let start = events
+            .iter()
+            .find(|event| event.event == "message_start")
+            .expect("message_start should exist");
+        assert_eq!(
+            start.data["message"]["usage"]["cache_creation_input_tokens"],
+            json!(45)
+        );
+        assert_eq!(
+            start.data["message"]["usage"]["cache_read_input_tokens"],
+            json!(67)
+        );
+
+        let delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should exist");
+        assert_eq!(
+            delta.data["usage"]["cache_creation_input_tokens"],
+            json!(45)
+        );
+        assert_eq!(delta.data["usage"]["cache_read_input_tokens"], json!(67));
     }
 }

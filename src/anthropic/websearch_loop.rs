@@ -27,6 +27,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::model::config::ToolCompatibilityMode;
 use crate::token;
 
+use super::cache_metering::CacheUsage;
 use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::{SseEvent, THINKING_SIGNATURE_PLACEHOLDER, ToolJsonAccumulator};
@@ -406,6 +407,7 @@ pub(super) async fn run_web_search_loop(
     hook: UsageRecordHook,
     stream_client: bool,
     tool_compatibility_mode: ToolCompatibilityMode,
+    cache_usage: CacheUsage,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -478,7 +480,9 @@ pub(super) async fn run_web_search_loop(
                 "tool_use".to_string()
             }
         });
-        let final_input = last_context_input.unwrap_or(fallback_input_tokens);
+        let total_input = last_context_input.unwrap_or(fallback_input_tokens);
+        let (final_input, cache_creation_tokens, cache_read_tokens) =
+            cache_usage.split_against_total(total_input);
 
         // Final content: presentation blocks (per-round search) + final-round text + final-round tool_use (exec, etc., returned as-is)
         let mut content: Vec<Value> = presentation.clone();
@@ -512,8 +516,8 @@ pub(super) async fn run_web_search_loop(
             last_credential_id,
             final_input,
             output_tokens,
-            0,
-            0,
+            cache_creation_tokens,
+            cache_read_tokens,
             total_credits,
             "success",
         );
@@ -525,6 +529,8 @@ pub(super) async fn run_web_search_loop(
                 &stop_reason,
                 final_input,
                 output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
             )
         } else {
             render_json(
@@ -533,6 +539,8 @@ pub(super) async fn run_web_search_loop(
                 &stop_reason,
                 final_input,
                 output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
             )
         };
     }
@@ -564,6 +572,8 @@ fn render_json(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> Response {
     let body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -576,8 +586,8 @@ fn render_json(
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0
+            "cache_creation_input_tokens": cache_creation_tokens,
+            "cache_read_input_tokens": cache_read_tokens
         }
     });
     (StatusCode::OK, Json(body)).into_response()
@@ -590,8 +600,18 @@ fn render_sse(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> Response {
-    let events = build_sse_events(model, content, stop_reason, input_tokens, output_tokens);
+    let events = build_sse_events(
+        model,
+        content,
+        stop_reason,
+        input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    );
     let stream = stream::iter(
         events
             .into_iter()
@@ -613,6 +633,8 @@ fn build_sse_events(
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
@@ -632,8 +654,8 @@ fn build_sse_events(
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": cache_creation_tokens,
+                    "cache_read_input_tokens": cache_read_tokens
                 }
             }
         }),
@@ -769,7 +791,11 @@ fn build_sse_events(
         json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason},
-            "usage": {"output_tokens": output_tokens}
+            "usage": {
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": cache_creation_tokens,
+                "cache_read_input_tokens": cache_read_tokens
+            }
         }),
     ));
     events.push(SseEvent::new(
@@ -927,13 +953,15 @@ mod tests {
             json!({"type": "text", "text": "done"}),
             json!({"type": "tool_use", "id": "toolu_exec", "name": "exec", "input": {"cmd": "ls"}}),
         ];
-        let events = build_sse_events("claude-opus-4-8", content, "tool_use", 10, 5);
+        let events = build_sse_events("claude-opus-4-8", content, "tool_use", 10, 5, 3, 2);
 
         // Must contain message_start / message_delta(stop_reason) / message_stop
         assert_eq!(events.first().unwrap().event, "message_start");
         assert_eq!(events.last().unwrap().event, "message_stop");
         let delta = events.iter().find(|e| e.event == "message_delta").unwrap();
         assert_eq!(delta.data["delta"]["stop_reason"], "tool_use");
+        assert_eq!(delta.data["usage"]["cache_creation_input_tokens"], json!(3));
+        assert_eq!(delta.data["usage"]["cache_read_input_tokens"], json!(2));
 
         // the server_tool_use block is placed into content_block_start as-is
         let has_server_tool = events.iter().any(|e| {
@@ -972,7 +1000,7 @@ mod tests {
             "type": "redacted_thinking",
             "data": "encrypted-thinking"
         })];
-        let events = build_sse_events("claude-opus-4-8", content, "end_turn", 10, 5);
+        let events = build_sse_events("claude-opus-4-8", content, "end_turn", 10, 5, 0, 0);
 
         let start = events
             .iter()
@@ -991,5 +1019,41 @@ mod tests {
             }),
             "redacted_thinking must not be serialized as plaintext thinking_delta"
         );
+    }
+
+    #[test]
+    fn sse_events_include_cache_usage_in_start_and_delta() {
+        let events = build_sse_events(
+            "claude-opus-4-8",
+            vec![json!({"type": "text", "text": "done"})],
+            "end_turn",
+            123,
+            7,
+            45,
+            67,
+        );
+
+        let start = events
+            .iter()
+            .find(|e| e.event == "message_start")
+            .expect("message_start should exist");
+        assert_eq!(
+            start.data["message"]["usage"]["cache_creation_input_tokens"],
+            json!(45)
+        );
+        assert_eq!(
+            start.data["message"]["usage"]["cache_read_input_tokens"],
+            json!(67)
+        );
+
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("message_delta should exist");
+        assert_eq!(
+            delta.data["usage"]["cache_creation_input_tokens"],
+            json!(45)
+        );
+        assert_eq!(delta.data["usage"]["cache_read_input_tokens"], json!(67));
     }
 }

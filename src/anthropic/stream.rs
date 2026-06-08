@@ -1670,6 +1670,18 @@ impl BufferedStreamContext {
         self.inner.cache_usage = cache_usage;
     }
 
+    /// 提前生成并取走初始事件，用于 buffered SSE 在读取完整上游前先发首包。
+    ///
+    /// 这里不会包含 tool_use 输入，因此仍然保留半截 JSON 的缓冲保护。
+    pub fn take_initial_events_for_stream_start(&mut self) -> Vec<SseEvent> {
+        if self.initial_events_generated {
+            return Vec::new();
+        }
+
+        self.initial_events_generated = true;
+        self.inner.generate_initial_events()
+    }
+
     /// 处理 Kiro 事件并缓冲结果
     ///
     /// 复用 StreamContext 的事件处理逻辑，但把结果缓存而不是立即发送。
@@ -1806,6 +1818,48 @@ mod tests {
         assert_eq!(usage["input_tokens"], json!(20));
         assert_eq!(usage["cache_creation_input_tokens"], json!(50));
         assert_eq!(usage["cache_read_input_tokens"], json!(30));
+    }
+
+    #[test]
+    fn test_buffered_context_can_emit_initial_events_before_final_flush() {
+        let mut ctx = BufferedStreamContext::new("test-model", 100, false, HashMap::new());
+        ctx.set_cache_usage(crate::anthropic::cache_metering::CacheUsage {
+            cache_read: 25,
+            cache_covered_est: 70,
+            prompt_total_est: 100,
+        });
+
+        let initial = ctx.take_initial_events_for_stream_start();
+        assert_eq!(
+            initial
+                .iter()
+                .filter(|e| e.event == "message_start")
+                .count(),
+            1,
+            "initial stream start should contain exactly one message_start"
+        );
+        assert!(
+            ctx.take_initial_events_for_stream_start().is_empty(),
+            "initial events should only be emitted once"
+        );
+
+        ctx.process_and_buffer(&Event::AssistantResponse(
+            serde_json::from_value(serde_json::json!({"content": "hello"})).unwrap(),
+        ));
+        let final_events = ctx.finish_and_get_all_events();
+
+        assert!(
+            final_events.iter().all(|e| e.event != "message_start"),
+            "final buffered flush must not replay message_start after it was sent early"
+        );
+        let message_delta = final_events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("should have message_delta event");
+        let usage = &message_delta.data["usage"];
+        assert_eq!(usage["input_tokens"], json!(30));
+        assert_eq!(usage["cache_creation_input_tokens"], json!(45));
+        assert_eq!(usage["cache_read_input_tokens"], json!(25));
     }
 
     #[test]

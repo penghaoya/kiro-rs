@@ -550,28 +550,52 @@ pub async fn post_messages(
     override_thinking_from_model_name(&mut payload);
     normalize_web_search_tool(&mut payload);
 
+    // CacheMeter 必须在 WebSearch 分流前计算；Claude Code 常驻 WebSearch 工具时
+    // 会进入 agentic loop，同样需要向客户端上报 cache usage。
+    let total_input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+    let cache_usage = state
+        .cache_meter
+        .as_ref()
+        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+        .unwrap_or_default();
+
     // 检查是否为 direct WebSearch 请求。真实 Claude Code 会把动态 system-reminder
     // 放在首个 user text block，此时必须走 agentic loop，让 Kiro 模型自己产出 query。
     if websearch::has_web_search_tool(&payload) && websearch::is_direct_web_search_request(&payload)
     {
         tracing::info!("检测到 direct WebSearch 工具，路由到 MCP 快路径");
 
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
+        let (input_tokens, cache_creation_tokens, cache_read_tokens) =
+            cache_usage.split_against_total(total_input_tokens);
 
-        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        )
+        .await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
         let status = if resp.status().is_success() {
             "success"
         } else {
             "error"
         };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        hook.record(
+            0,
+            input_tokens,
+            0,
+            cache_creation_tokens,
+            cache_read_tokens,
+            0.0,
+            status,
+        );
         return resp;
     }
 
@@ -588,6 +612,7 @@ pub async fn post_messages(
             hook,
             payload_stream,
             state.tool_compatibility_mode,
+            cache_usage,
         )
         .await;
     }
@@ -644,14 +669,6 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 估算输入 tokens
-    let total_input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
-    ) as i32;
-
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -660,13 +677,6 @@ pub async fn post_messages(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
-
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
 
     if payload.stream {
         // 流式响应
@@ -1022,8 +1032,10 @@ async fn handle_non_stream_request(
                                 Ok(None) => {}
                                 Err(e) => {
                                     tracing::error!("{}", e);
-                                    let total_input =
-                                        resolve_usage_input_tokens(input_tokens, context_input_tokens);
+                                    let total_input = resolve_usage_input_tokens(
+                                        input_tokens,
+                                        context_input_tokens,
+                                    );
                                     let (input, cache_creation, cache_read) =
                                         cache_usage.split_against_total(total_input);
                                     hook.record(
@@ -1360,27 +1372,51 @@ pub async fn post_messages_cc(
     override_thinking_from_model_name(&mut payload);
     normalize_web_search_tool(&mut payload);
 
+    // CacheMeter 必须在 WebSearch 分流前计算；/cc/v1/messages 常驻工具列表
+    // 包含 WebSearch 时会进入 agentic loop，不能丢 cache usage。
+    let total_input_tokens = token::count_all_tokens(
+        payload.model.clone(),
+        payload.system.clone(),
+        payload.messages.clone(),
+        payload.tools.clone(),
+    ) as i32;
+    let cache_usage = state
+        .cache_meter
+        .as_ref()
+        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+        .unwrap_or_default();
+
     // 检查是否为 direct WebSearch 请求。真实 Claude Code 会把动态 system-reminder
     // 放在首个 user text block，此时必须走 agentic loop，让 Kiro 模型自己产出 query。
     if websearch::has_web_search_tool(&payload) && websearch::is_direct_web_search_request(&payload)
     {
         tracing::info!("检测到 direct WebSearch 工具，路由到 MCP 快路径");
 
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
+        let (input_tokens, cache_creation_tokens, cache_read_tokens) =
+            cache_usage.split_against_total(total_input_tokens);
 
-        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(
+            provider,
+            &payload,
+            input_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
+        )
+        .await;
         let status = if resp.status().is_success() {
             "success"
         } else {
             "error"
         };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        hook.record(
+            0,
+            input_tokens,
+            0,
+            cache_creation_tokens,
+            cache_read_tokens,
+            0.0,
+            status,
+        );
         return resp;
     }
 
@@ -1397,6 +1433,7 @@ pub async fn post_messages_cc(
             hook,
             payload_stream,
             state.tool_compatibility_mode,
+            cache_usage,
         )
         .await;
     }
@@ -1453,14 +1490,6 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 计算总 input tokens
-    let total_input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
-    ) as i32;
-
     // 检查是否启用了thinking
     let thinking_enabled = payload
         .thinking
@@ -1469,13 +1498,6 @@ pub async fn post_messages_cc(
         .unwrap_or(false);
 
     let tool_name_map = conversion_result.tool_name_map;
-
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1581,10 +1603,10 @@ async fn handle_stream_request_buffered(
 /// 创建缓冲 SSE 事件流
 ///
 /// 工作流程：
-/// 1. 等待上游流完成，期间只发送 ping 保活信号
-/// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
-/// 4. 一次性发送所有事件
+/// 1. 先发送 Anthropic 初始事件，避免下游把 TTFB 记到上游结束时
+/// 2. 等待上游流完成，期间只发送 ping 保活信号
+/// 3. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
+/// 4. 流结束后，一次性发送剩余事件；工具 JSON 只在完整解析后发送
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
@@ -1600,15 +1622,39 @@ fn create_buffered_sse_stream(
             ctx,
             EventStreamDecoder::new(),
             false,
+            false,
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             hook,
             credential_id,
             tracer,
             0u64,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, initial_events_sent, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
             if finished {
                 return None;
+            }
+
+            if !initial_events_sent {
+                let bytes: Vec<Result<Bytes, Infallible>> = ctx
+                    .take_initial_events_for_stream_start()
+                    .into_iter()
+                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                    .collect();
+                return Some((
+                    stream::iter(bytes),
+                    (
+                        body_stream,
+                        ctx,
+                        decoder,
+                        false,
+                        true,
+                        ping_interval,
+                        hook,
+                        credential_id,
+                        tracer,
+                        sent_bytes,
+                    ),
+                ));
             }
 
             loop {
@@ -1621,7 +1667,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, initial_events_sent, ping_interval, hook, credential_id, tracer, sent_bytes)));
                     }
 
                     // 然后处理数据流
@@ -1667,7 +1713,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, initial_events_sent, ping_interval, hook, credential_id, tracer, sent_bytes)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
@@ -1686,7 +1732,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, initial_events_sent, ping_interval, hook, credential_id, tracer, sent_bytes)));
                             }
                         }
                     }
