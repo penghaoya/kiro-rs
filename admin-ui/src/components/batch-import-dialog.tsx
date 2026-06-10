@@ -12,7 +12,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled, getProxyPool } from '@/api/credentials'
-import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { extractErrorMessage, sha256Hex, shouldRollbackImportedCredential } from '@/lib/utils'
 
 interface BatchImportDialogProps {
   open: boolean
@@ -39,7 +39,7 @@ interface CredentialInput {
 
 interface VerificationResult {
   index: number
-  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed'
+  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'unverified' | 'duplicate' | 'failed'
   error?: string
   usage?: string
   email?: string
@@ -134,6 +134,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       )
 
       let successCount = 0
+      let unverifiedCount = 0
       let duplicateCount = 0
       let failCount = 0
       let rollbackSuccessCount = 0
@@ -240,6 +241,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         })
 
         let addedCredId: number | null = null
+        let addedCredEmail: string | undefined
 
         try {
           // 添加凭据
@@ -260,6 +262,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             })
 
             addedCredId = addedCred.credentialId
+            addedCredEmail = addedCred.email || cred.email?.trim() || undefined
 
             // 延迟 1 秒
             await new Promise(resolve => setTimeout(resolve, 1000))
@@ -269,7 +272,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
             successCount++
             existingApiKeyHashes.add(credHash)
-            const displayEmail = addedCred.email || cred.email?.trim() || undefined
+            const displayEmail = addedCredEmail
             setCurrentProcessing(displayEmail ? `验活成功: ${displayEmail}` : `验活成功: 凭据 ${i + 1}`)
             setResults(prev => {
               const newResults = [...prev]
@@ -314,6 +317,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           })
 
           addedCredId = addedCred.credentialId
+          addedCredEmail = addedCred.email || cred.email?.trim() || undefined
 
           // 延迟 1 秒
           await new Promise(resolve => setTimeout(resolve, 1000))
@@ -322,7 +326,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           const balance = await getCredentialBalance(addedCred.credentialId)
 
           // 验活成功
-          const oauthDisplayEmail = addedCred.email || cred.email?.trim() || undefined
+          const oauthDisplayEmail = addedCredEmail
           successCount++
           existingOauthHashes.add(credHash)
           setCurrentProcessing(oauthDisplayEmail ? `验活成功: ${oauthDisplayEmail}` : `验活成功: 凭据 ${i + 1}`)
@@ -338,7 +342,36 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             return newResults
           })
         } catch (error) {
-          // 验活失败，尝试回滚（先禁用再删除）
+          const errorMessage = extractErrorMessage(error)
+
+          if (addedCredId && !shouldRollbackImportedCredential(error)) {
+            unverifiedCount++
+            if (isApiKeyCred) {
+              existingApiKeyHashes.add(credHash)
+            } else {
+              existingOauthHashes.add(credHash)
+            }
+
+            const displayEmail = addedCredEmail || cred.email?.trim() || undefined
+            const credentialId = addedCredId
+            setCurrentProcessing(displayEmail ? `已导入，待验活: ${displayEmail}` : `已导入，待验活: 凭据 ${i + 1}`)
+            setResults(prev => {
+              const newResults = [...prev]
+              newResults[i] = {
+                ...newResults[i],
+                status: 'unverified',
+                error: `验活暂未完成: ${errorMessage}`,
+                usage: '验活未完成',
+                email: displayEmail,
+                credentialId,
+              }
+              return newResults
+            })
+            setProgress({ current: i + 1, total: credentials.length })
+            continue
+          }
+
+          // 永久性验活失败，尝试回滚（先禁用再删除）
           let rollbackStatus: VerificationResult['rollbackStatus'] = 'skipped'
           let rollbackError: string | undefined
 
@@ -362,7 +395,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             newResults[i] = {
               ...newResults[i],
               status: 'failed',
-              error: extractErrorMessage(error),
+              error: errorMessage,
               email: undefined,
               rollbackStatus,
               rollbackError,
@@ -375,13 +408,14 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
       }
 
       // 显示结果
-      if (failCount === 0 && duplicateCount === 0) {
+      if (failCount === 0 && duplicateCount === 0 && unverifiedCount === 0) {
         toast.success(`成功导入并验活 ${successCount} 个凭据`)
       } else {
+        const pendingSummary = unverifiedCount > 0 ? `，待验活 ${unverifiedCount} 个` : ''
         const failureSummary = failCount > 0
           ? `，失败 ${failCount} 个（已排除 ${rollbackSuccessCount}，未排除 ${rollbackFailedCount}，无需排除 ${rollbackSkippedCount}）`
           : ''
-        toast.info(`验活完成：成功 ${successCount} 个，重复 ${duplicateCount} 个${failureSummary}`)
+        toast.info(`验活完成：成功 ${successCount} 个${pendingSummary}，重复 ${duplicateCount} 个${failureSummary}`)
 
         if (rollbackFailedCount > 0) {
           toast.warning(`有 ${rollbackFailedCount} 个失败凭据回滚未完成，请手动禁用并删除`)
@@ -403,6 +437,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         return <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
       case 'verified':
         return <CheckCircle2 className="w-5 h-5 text-green-500" />
+      case 'unverified':
+        return <AlertCircle className="w-5 h-5 text-amber-500" />
       case 'duplicate':
         return <AlertCircle className="w-5 h-5 text-yellow-500" />
       case 'failed':
@@ -420,6 +456,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         return '验活中...'
       case 'verified':
         return '验活成功'
+      case 'unverified':
+        return '已导入（待验活）'
       case 'duplicate':
         return '重复凭据'
       case 'failed':
@@ -458,7 +496,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               className="flex min-h-[200px] w-full rounded-xl border border-input bg-background/60 px-3.5 py-2.5 text-sm transition-all duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 focus-visible:bg-background disabled:cursor-not-allowed disabled:opacity-50 font-mono"
             />
             <p className="text-xs text-muted-foreground">
-              💡 导入时自动验活，失败的凭据会被排除
+              导入后自动验活；上游暂时失败时会保留凭据，可稍后查询余额。
             </p>
           </div>
 
@@ -487,6 +525,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               <div className="flex gap-4 text-sm">
                 <span className="text-green-600 dark:text-green-400">
                   ✓ 成功: {results.filter(r => r.status === 'verified').length}
+                </span>
+                <span className="text-amber-600 dark:text-amber-400">
+                  ! 待验活: {results.filter(r => r.status === 'unverified').length}
                 </span>
                 <span className="text-yellow-600 dark:text-yellow-400">
                   ⚠ 重复: {results.filter(r => r.status === 'duplicate').length}
@@ -517,7 +558,11 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
                           </div>
                         )}
                         {result.error && (
-                          <div className="text-xs text-red-600 dark:text-red-400 mt-1">
+                          <div className={`text-xs mt-1 ${
+                            result.status === 'unverified'
+                              ? 'text-amber-600 dark:text-amber-400'
+                              : 'text-red-600 dark:text-red-400'
+                          }`}>
                             {result.error}
                           </div>
                         )}

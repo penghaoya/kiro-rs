@@ -35,6 +35,8 @@ use super::types::{
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+/// 余额上游瞬态错误重试次数：首次请求 + 2 次退避重试
+const BALANCE_FETCH_MAX_ATTEMPTS: usize = 3;
 
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// 在线检查更新结果缓存时间（秒），30 分钟。
@@ -678,11 +680,43 @@ impl AdminService {
 
     /// 从上游获取余额（无缓存）
     async fn fetch_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        let usage = self
-            .token_manager
-            .get_usage_limits_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))?;
+        let mut usage = None;
+
+        for attempt in 1..=BALANCE_FETCH_MAX_ATTEMPTS {
+            match self.token_manager.get_usage_limits_for(id).await {
+                Ok(fetched_usage) => {
+                    usage = Some(fetched_usage);
+                    break;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+
+                    if attempt < BALANCE_FETCH_MAX_ATTEMPTS
+                        && Self::is_retryable_balance_error(&msg)
+                    {
+                        let delay_ms = match attempt {
+                            1 => 700,
+                            _ => 1500,
+                        };
+                        tracing::warn!(
+                            "凭据 #{} 余额查询第 {} 次失败，将在 {}ms 后重试: {}",
+                            id,
+                            attempt,
+                            delay_ms,
+                            msg
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+
+                    return Err(self.classify_balance_error(anyhow::anyhow!(msg), id));
+                }
+            }
+        }
+
+        let usage = usage.ok_or_else(|| {
+            self.classify_balance_error(anyhow::anyhow!("获取使用额度失败: 未执行上游请求"), id)
+        })?;
 
         let current_usage = usage.current_usage();
         let usage_limit = usage.usage_limit();
@@ -711,6 +745,38 @@ impl AdminService {
                 .as_ref()
                 .and_then(|s| s.overage_capability.clone()),
         })
+    }
+
+    fn is_retryable_balance_error(msg: &str) -> bool {
+        if msg.contains("不存在")
+            || msg.contains("API Key 凭据不支持刷新")
+            || msg.contains("Invalid profileArn")
+        {
+            return false;
+        }
+
+        msg.contains("已被限流")
+            || msg.contains("429")
+            || msg.contains("认证失败")
+            || msg.contains("Token 无效或已过期")
+            || msg.contains("凭证已过期或无效")
+            || msg.contains("权限不足")
+            || msg.contains("403")
+            || msg.contains("服务器错误")
+            || msg.contains("暂时不可用")
+            || msg.contains("500")
+            || msg.contains("502")
+            || msg.contains("503")
+            || msg.contains("504")
+            || msg.contains("error sending request")
+            || msg.contains("error trying to connect")
+            || msg.contains("connection")
+            || msg.contains("timeout")
+            || msg.contains("timed out")
+            || msg.contains("proxy")
+            || msg.contains("SOCKS")
+            || msg.contains("dns")
+            || msg.contains("DNS")
     }
 
     /// 获取指定凭据当前可用的模型列表（按需实时查询上游，不缓存）
@@ -960,9 +1026,17 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
-        // 主动获取订阅等级，避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.token_manager.get_usage_limits_for(credential_id).await {
-            tracing::warn!("添加凭据后获取订阅等级失败（不影响凭据添加）: {}", e);
+        let removed_cached_balance = {
+            let mut cache = self.balance_cache.lock();
+            cache.remove(&credential_id).is_some()
+        };
+        if removed_cached_balance {
+            self.save_balance_cache();
+        }
+
+        // 主动预热余额缓存并更新订阅等级，避免前端验活再次打上游触发限流。
+        if let Err(e) = self.get_balance(credential_id).await {
+            tracing::warn!("添加凭据后预热余额缓存失败（不影响凭据添加）: {}", e);
         }
 
         Ok(AddCredentialResponse {

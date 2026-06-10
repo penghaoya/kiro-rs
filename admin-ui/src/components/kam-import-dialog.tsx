@@ -12,7 +12,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled, getProxyPool } from '@/api/credentials'
-import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import { extractErrorMessage, sha256Hex, shouldRollbackImportedCredential } from '@/lib/utils'
 
 interface KamImportDialogProps {
   open: boolean
@@ -60,7 +60,7 @@ function normalizeExpiresAt(value: unknown): string | undefined {
 
 interface VerificationResult {
   index: number
-  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'duplicate' | 'failed' | 'skipped'
+  status: 'pending' | 'checking' | 'verifying' | 'verified' | 'unverified' | 'duplicate' | 'failed' | 'skipped'
   error?: string
   usage?: string
   email?: string
@@ -317,6 +317,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       )
 
       let successCount = 0
+      let unverifiedCount = 0
       let duplicateCount = 0
       let failCount = 0
       let skippedCount = 0
@@ -365,6 +366,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         })
 
         let addedCredId: number | null = null
+        let addedCredEmail: string | undefined
 
         try {
           const clientId = cred.clientId?.trim() || undefined
@@ -399,6 +401,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           })
 
           addedCredId = addedCred.credentialId
+          addedCredEmail = addedCred.email || account.email || undefined
 
           await new Promise(resolve => setTimeout(resolve, 1000))
 
@@ -406,19 +409,44 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           successCount++
           existingTokenHashes.add(tokenHash)
-          setCurrentProcessing(`验活成功: ${addedCred.email || account.email || `账号 ${i + 1}`}`)
+          setCurrentProcessing(`验活成功: ${addedCredEmail || `账号 ${i + 1}`}`)
           setResults(prev => {
             const next = [...prev]
             next[i] = {
               ...next[i],
               status: 'verified',
               usage: `${balance.currentUsage}/${balance.usageLimit}`,
-              email: addedCred.email || account.email,
+              email: addedCredEmail,
               credentialId: addedCred.credentialId,
             }
             return next
           })
         } catch (error) {
+          const errorMessage = extractErrorMessage(error)
+
+          if (addedCredId && !shouldRollbackImportedCredential(error)) {
+            unverifiedCount++
+            existingTokenHashes.add(tokenHash)
+
+            const displayEmail = addedCredEmail || account.email || undefined
+            const credentialId = addedCredId
+            setCurrentProcessing(`已导入，待验活: ${displayEmail || `账号 ${i + 1}`}`)
+            setResults(prev => {
+              const next = [...prev]
+              next[i] = {
+                ...next[i],
+                status: 'unverified',
+                error: `验活暂未完成: ${errorMessage}`,
+                usage: '验活未完成',
+                email: displayEmail,
+                credentialId,
+              }
+              return next
+            })
+            setProgress({ current: i + 1, total: validAccounts.length })
+            continue
+          }
+
           let rollbackStatus: VerificationResult['rollbackStatus'] = 'skipped'
           let rollbackError: string | undefined
 
@@ -438,7 +466,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             next[i] = {
               ...next[i],
               status: 'failed',
-              error: extractErrorMessage(error),
+              error: errorMessage,
               rollbackStatus,
               rollbackError,
             }
@@ -452,11 +480,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       // 汇总
       const parts: string[] = []
       if (successCount > 0) parts.push(`成功 ${successCount}`)
+      if (unverifiedCount > 0) parts.push(`待验活 ${unverifiedCount}`)
       if (duplicateCount > 0) parts.push(`重复 ${duplicateCount}`)
       if (failCount > 0) parts.push(`失败 ${failCount}`)
       if (skippedCount > 0) parts.push(`跳过 ${skippedCount}`)
 
-      if (failCount === 0 && duplicateCount === 0 && skippedCount === 0) {
+      if (failCount === 0 && duplicateCount === 0 && skippedCount === 0 && unverifiedCount === 0) {
         toast.success(`成功导入并验活 ${successCount} 个凭据`)
       } else {
         toast.info(`导入完成：${parts.join('，')}`)
@@ -477,6 +506,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         return <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
       case 'verified':
         return <CheckCircle2 className="w-5 h-5 text-green-500" />
+      case 'unverified':
+        return <AlertCircle className="w-5 h-5 text-amber-500" />
       case 'duplicate':
         return <AlertCircle className="w-5 h-5 text-yellow-500" />
       case 'skipped':
@@ -492,6 +523,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
       case 'checking': return '检查重复...'
       case 'verifying': return '验活中...'
       case 'verified': return '验活成功'
+      case 'unverified': return '已导入（待验活）'
       case 'duplicate': return '重复凭据'
       case 'skipped': return '已跳过（error 状态）'
       case 'failed':
@@ -608,6 +640,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                 <span className="text-green-600 dark:text-green-400">
                   ✓ 成功: {results.filter(r => r.status === 'verified').length}
                 </span>
+                <span className="text-amber-600 dark:text-amber-400">
+                  ! 待验活: {results.filter(r => r.status === 'unverified').length}
+                </span>
                 <span className="text-yellow-600 dark:text-yellow-400">
                   ⚠ 重复: {results.filter(r => r.status === 'duplicate').length}
                 </span>
@@ -637,7 +672,11 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
                           <div className="text-xs text-muted-foreground mt-1">用量: {result.usage}</div>
                         )}
                         {result.error && (
-                          <div className="text-xs text-red-600 dark:text-red-400 mt-1">{result.error}</div>
+                          <div className={`text-xs mt-1 ${
+                            result.status === 'unverified'
+                              ? 'text-amber-600 dark:text-amber-400'
+                              : 'text-red-600 dark:text-red-400'
+                          }`}>{result.error}</div>
                         )}
                         {result.rollbackError && (
                           <div className="text-xs text-red-600 dark:text-red-400 mt-1">回滚失败: {result.rollbackError}</div>

@@ -26,6 +26,31 @@ export function extractErrorMessage(error: unknown): string {
   return parsed.title
 }
 
+export function getErrorStatusCode(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined
+
+  const response = (error as { response?: { status?: unknown } }).response
+  return typeof response?.status === 'number' ? response.status : undefined
+}
+
+export function getApiErrorType(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined
+
+  const response = (error as { response?: { data?: unknown } }).response
+  const data = response?.data
+  if (!data || typeof data !== 'object') return undefined
+
+  const errorObj = (data as { error?: unknown }).error
+  if (!errorObj || typeof errorObj !== 'object') return undefined
+
+  const type = (errorObj as { type?: unknown }).type
+  return typeof type === 'string' ? type : undefined
+}
+
+export function shouldRollbackImportedCredential(error: unknown): boolean {
+  return getErrorStatusCode(error) === 400 || getApiErrorType(error) === 'invalid_request'
+}
+
 /**
  * 解析错误，返回结构化的错误信息
  */
