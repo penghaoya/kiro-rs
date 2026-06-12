@@ -186,7 +186,7 @@ function App() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-[1400px] px-4 md:px-8 py-8">
+      <main className="mx-auto max-w-[1400px] px-4 md:px-8 py-4">
         <Suspense
           fallback={
             <div className="text-sm text-muted-foreground">加载中…</div>

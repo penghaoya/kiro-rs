@@ -167,8 +167,8 @@ function TimeSeriesChartImpl({ data, range }: Props) {
   )
 
   return (
-    <ResponsiveContainer width="100%" height={320}>
-      <LineChart data={formatted} margin={{ top: 16, right: 16, left: 0, bottom: 0 }}>
+    <ResponsiveContainer width="100%" height={235}>
+      <LineChart data={formatted} margin={{ top: 12, right: 16, left: 0, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" className="stroke-border/50" />
         <XAxis
           dataKey="label"

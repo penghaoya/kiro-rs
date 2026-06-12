@@ -24,15 +24,15 @@ function CredentialBarChartImpl({ data }: Props) {
 
   if (data.length === 0) {
     return (
-      <div className="flex h-[260px] items-center justify-center text-sm text-muted-foreground">
+      <div className="flex h-[200px] items-center justify-center text-sm text-muted-foreground">
         暂无数据
       </div>
     )
   }
 
   return (
-    <ResponsiveContainer width="100%" height={340}>
-      <BarChart data={formatted} margin={{ top: 8, right: 16, left: 0, bottom: 64 }}>
+    <ResponsiveContainer width="100%" height={290}>
+      <BarChart data={formatted} margin={{ top: 4, right: 16, left: 0, bottom: 56 }}>
         <CartesianGrid strokeDasharray="3 3" className="stroke-border/50" />
         <XAxis
           dataKey="label"

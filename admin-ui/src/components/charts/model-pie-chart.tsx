@@ -27,14 +27,14 @@ function ModelPieChartImpl({ data }: Props) {
 
   if (data.length === 0) {
     return (
-      <div className="flex h-[260px] items-center justify-center text-sm text-muted-foreground">
+      <div className="flex h-[200px] items-center justify-center text-sm text-muted-foreground">
         暂无数据
       </div>
     )
   }
 
   return (
-    <ResponsiveContainer width="100%" height={260}>
+    <ResponsiveContainer width="100%" height={200}>
       <PieChart>
         <Pie
           data={chartData}

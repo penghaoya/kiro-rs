@@ -50,15 +50,31 @@ export function OverviewPage() {
 
   return (
     <div>
-      <div className="mb-6">
-        <h1 className="text-[28px] font-semibold tracking-tight leading-tight">概览</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          中转站调用情况、Token 消耗趋势与上游凭据贡献
-        </p>
+      {/* 标题行：小标题 + 时间范围切换（全页共用），单行省纵向空间 */}
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-baseline gap-3">
+          <h1 className="text-xl font-semibold tracking-tight leading-tight">概览</h1>
+          <p className="hidden text-[13px] text-muted-foreground md:block">
+            中转站调用情况、Token 消耗趋势与上游凭据贡献
+          </p>
+        </div>
+        <div className="flex items-center gap-1 rounded-full border border-border/60 p-0.5">
+          {RANGES.map((r) => (
+            <Button
+              key={r.value}
+              size="sm"
+              variant={range === r.value ? 'default' : 'ghost'}
+              className="h-7 rounded-full px-3 text-xs"
+              onClick={() => setRange(r.value)}
+            >
+              {r.label}
+            </Button>
+          ))}
+        </div>
       </div>
 
       {/* 顶部卡片 */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5 mb-6">
+      <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-5 mb-3">
         <StatCard
           icon={<Activity className="h-4 w-4" />}
           label={`近 ${rangeText}调用`}
@@ -100,28 +116,13 @@ export function OverviewPage() {
       </div>
 
       {/* 时序图 */}
-      <Card className="mb-6">
-        <CardContent className="p-5">
-          <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
-            <div>
-              <h2 className="text-base font-semibold tracking-tight">Token 使用趋势</h2>
-              <p className="text-[12px] text-muted-foreground">
-                按 {range === '30d' ? '天' : '小时'} 聚合 · 输入/输出/缓存读写
-              </p>
-            </div>
-            <div className="flex items-center gap-1 rounded-full border border-border/60 p-0.5">
-              {RANGES.map((r) => (
-                <Button
-                  key={r.value}
-                  size="sm"
-                  variant={range === r.value ? 'default' : 'ghost'}
-                  className="h-7 rounded-full px-3 text-xs"
-                  onClick={() => setRange(r.value)}
-                >
-                  {r.label}
-                </Button>
-              ))}
-            </div>
+      <Card className="mb-3">
+        <CardContent className="p-4">
+          <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
+            <h2 className="text-sm font-semibold tracking-tight">Token 使用趋势</h2>
+            <p className="text-[11px] text-muted-foreground">
+              按 {range === '30d' ? '天' : '小时'} 聚合 · 输入/输出/缓存读写
+            </p>
           </div>
           {/* range 切换时整体 fade + 上移：用 key={range} 强制重挂，
               叠加 Recharts 折线动画形成"按下按钮 → 内容刷新"的视觉反馈 */}
@@ -132,16 +133,16 @@ export function OverviewPage() {
       </Card>
 
       {/* 模型 + 凭据 两栏 */}
-      <div className="grid gap-4 lg:grid-cols-2 mb-6">
+      <div className="grid gap-3 lg:grid-cols-2">
         <Card>
-          <CardContent className="p-5">
-            <div className="mb-3 flex items-center justify-between">
-              <h2 className="text-base font-semibold tracking-tight">按模型分布</h2>
+          <CardContent className="p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <h2 className="text-sm font-semibold tracking-tight">按模型分布</h2>
               <span className="text-[11px] text-muted-foreground">{rangeLabel(range)}</span>
             </div>
             <ModelPieChart data={modelData} />
             {byModel && byModel.length > 0 && (
-              <div className="mt-3 max-h-32 overflow-auto text-[12px]">
+              <div className="mt-2 max-h-24 overflow-auto text-[12px]">
                 <table className="w-full">
                   <thead className="text-muted-foreground">
                     <tr>
@@ -168,9 +169,9 @@ export function OverviewPage() {
         </Card>
 
         <Card>
-          <CardContent className="p-5">
-            <div className="mb-3 flex items-center justify-between">
-              <h2 className="text-base font-semibold tracking-tight">按上游凭据分布</h2>
+          <CardContent className="p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <h2 className="text-sm font-semibold tracking-tight">按上游凭据分布</h2>
               <span className="text-[11px] text-muted-foreground inline-flex items-center gap-1">
                 <Server className="h-3 w-3" />Top {Math.min(byCred?.length ?? 0, 12)}
               </span>
@@ -196,13 +197,13 @@ function StatCard({
 }) {
   return (
     <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-      <CardContent className="p-5">
-        <div className="flex items-center gap-2 text-[13px] font-medium text-muted-foreground">
+      <CardContent className="px-4 py-3">
+        <div className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
           {icon}
-          {label}
+          <span className="truncate">{label}</span>
         </div>
-        <div className="mt-2 flex items-end justify-between">
-          <span className="text-3xl font-semibold tracking-tight tabular-nums">{value}</span>
+        <div className="mt-1 flex items-end justify-between">
+          <span className="text-2xl font-semibold tracking-tight tabular-nums">{value}</span>
           {extra}
         </div>
       </CardContent>
