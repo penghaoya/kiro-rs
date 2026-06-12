@@ -17,6 +17,8 @@ export interface CredentialStatusItem {
   isCurrent: boolean
   expiresAt: string | null
   authMethod: string | null
+  /** 身份提供商（登录方式：Google / Github / Enterprise 等） */
+  provider?: string
   hasProfileArn: boolean
   email?: string
   refreshTokenHash?: string

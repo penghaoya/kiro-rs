@@ -13,14 +13,12 @@ import {
   Clock,
   ScrollText,
   Boxes,
-  Server,
   Copy,
   Check,
   KeyRound,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -133,17 +131,33 @@ function formatRateLimitCountdown(ms: number): string {
  *  这里用固定 10000 作为进度条参照，使超额条能反映真实占比而非恒满。 */
 const OVERAGE_CAP = 10000;
 
-/** 按认证方式给字母头像着色（参考 kiro-account-manager 的 provider 配色） */
-function avatarColorClass(authMethod: string | null): string {
+/**
+ * 登录方式（provider）元信息：展示名 + 头像配色。
+ * provider 缺失时回退到认证方式推断配色。
+ */
+function providerMeta(
+  provider: string | undefined,
+  authMethod: string | null,
+): { label: string | null; avatarClass: string } {
+  const p = (provider || "").toLowerCase();
+  if (p.includes("google"))
+    return { label: "Google", avatarClass: "bg-red-500/10 text-red-500" };
+  if (p.includes("github"))
+    return {
+      label: "GitHub",
+      avatarClass: "bg-slate-500/10 text-slate-600 dark:text-slate-300",
+    };
+  if (p.includes("enterprise"))
+    return { label: "Enterprise", avatarClass: "bg-orange-500/10 text-orange-500" };
+  if (provider)
+    return { label: provider, avatarClass: "bg-primary/10 text-primary" };
   switch (authMethod) {
-    case "social":
-      return "bg-red-500/10 text-red-500";
     case "idc":
-      return "bg-blue-500/10 text-blue-500";
+      return { label: null, avatarClass: "bg-blue-500/10 text-blue-500" };
     case "api_key":
-      return "bg-slate-500/10 text-slate-500";
+      return { label: null, avatarClass: "bg-slate-500/10 text-slate-500" };
     default:
-      return "bg-primary/10 text-primary";
+      return { label: null, avatarClass: "bg-primary/10 text-primary" };
   }
 }
 
@@ -423,6 +437,7 @@ export function CredentialCard({
   const isRateLimited = !credential.disabled && rateLimitRemainingMs > 0;
 
   const displayName = credential.email || `凭据 #${credential.id}`;
+  const provider = providerMeta(credential.provider, credential.authMethod);
   // 隐私模式只影响展示，复制仍是明文
   const shownName =
     privacyMode && credential.email ? maskEmail(credential.email) : displayName;
@@ -507,8 +522,8 @@ export function CredentialCard({
           <div className="pointer-events-none absolute -left-px -right-px -top-px z-10 h-1 rounded-t-2xl bg-gradient-to-r from-emerald-500/80 to-green-400/80" />
         )}
 
-        <CardHeader className="p-4 pb-2.5">
-          <div className="flex items-start gap-2.5">
+        <CardHeader className="p-3.5 pb-2">
+          <div className="flex items-start gap-2">
             <label
               data-no-rect-select
               className="mt-1.5 flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-accent"
@@ -523,9 +538,9 @@ export function CredentialCard({
                 onCheckedChange={onToggleSelect}
               />
             </label>
-            {/* 字母头像：按认证方式着色 */}
+            {/* 字母头像：按登录方式（provider）着色 */}
             <div
-              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border/50 text-sm font-bold ${avatarColorClass(credential.authMethod)}`}
+              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border/50 text-sm font-bold ${provider.avatarClass}`}
             >
               {displayName[0].toUpperCase()}
             </div>
@@ -546,9 +561,31 @@ export function CredentialCard({
                     <Copy className="h-3 w-3" />
                   )}
                 </button>
+                {balance?.subscriptionTitle && (
+                  <SubscriptionBadge
+                    title={balance.subscriptionTitle}
+                    className="shrink-0"
+                  />
+                )}
               </div>
-              <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                Kiro {authLabel ?? "未知"} 账号 · #{credential.id}
+              {/* 副标题一行式：登录方式 · 认证类型 · endpoint · 编号（· ARN） */}
+              <div
+                className="mt-0.5 truncate text-xs text-muted-foreground"
+                title={
+                  credential.configuredEndpoint
+                    ? `显式 endpoint: ${credential.configuredEndpoint}；生效 endpoint: ${credential.effectiveEndpoint}`
+                    : `跟随默认 endpoint；生效 endpoint: ${credential.effectiveEndpoint}`
+                }
+              >
+                {[
+                  provider.label,
+                  authLabel ?? "未知",
+                  credential.configuredEndpoint || credential.effectiveEndpoint,
+                  `#${credential.id}`,
+                  credential.hasProfileArn ? "ARN" : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
               </div>
             </div>
             {/* 右上角：超额开关 + 启用开关 + 状态胶囊 */}
@@ -583,38 +620,11 @@ export function CredentialCard({
               <StatusPill {...statusPill} />
             </div>
           </div>
-
-          {/* 徽章行：订阅 / 认证方式 / Endpoint / ARN */}
-          <div className="flex flex-wrap items-center gap-1 pt-1">
-            {balance?.subscriptionTitle && (
-              <SubscriptionBadge title={balance.subscriptionTitle} />
-            )}
-            {credential.authMethod && (
-              <Badge variant="secondary">{authLabel}</Badge>
-            )}
-            <Badge
-              variant="outline"
-              className="gap-1 font-normal"
-              title={
-                credential.configuredEndpoint
-                  ? `显式 endpoint: ${credential.configuredEndpoint}；生效 endpoint: ${credential.effectiveEndpoint}`
-                  : `跟随默认 endpoint；生效 endpoint: ${credential.effectiveEndpoint}`
-              }
-            >
-              <Server className="h-3 w-3 opacity-70" />
-              {credential.configuredEndpoint || credential.effectiveEndpoint}
-            </Badge>
-            {credential.hasProfileArn && (
-              <Badge variant="outline" title="已配置 Profile ARN">
-                ARN
-              </Badge>
-            )}
-          </div>
         </CardHeader>
 
-        <CardContent className="flex flex-1 flex-col space-y-3 p-4 pt-0">
-          {/* 信息行：紧凑指标条 — 优先级 / 失败 / 刷新失败 / 成功，最后调用单列右对齐 */}
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[13px]">
+        <CardContent className="flex flex-1 flex-col space-y-2.5 p-3.5 pt-0">
+          {/* 信息行：紧凑指标条 — 优先级 / 失败 /（刷新失败）/ 成功，最后调用右对齐 */}
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
             <div className="flex items-center gap-1.5">
               <span className="text-muted-foreground">优先级</span>
               {editingPriority ? (
@@ -695,14 +705,14 @@ export function CredentialCard({
               </button>
             </div>
 
-            <div className="flex items-center gap-1.5">
-              <span className="text-muted-foreground">刷新失败</span>
-              <span
-                className={`px-1.5 tabular-nums font-medium ${credential.refreshFailureCount > 0 ? "text-destructive" : ""}`}
-              >
-                {credential.refreshFailureCount}
-              </span>
-            </div>
+            {credential.refreshFailureCount > 0 && (
+              <div className="flex items-center gap-1.5">
+                <span className="text-muted-foreground">刷新失败</span>
+                <span className="px-1 font-medium tabular-nums text-destructive">
+                  {credential.refreshFailureCount}
+                </span>
+              </div>
+            )}
 
             <div className="flex items-center gap-1.5">
               <span className="text-muted-foreground">成功</span>
@@ -724,27 +734,34 @@ export function CredentialCard({
               </span>
             </div>
 
-            {credential.maskedApiKey && (
-              <div className="flex w-full items-center justify-between gap-2 border-t border-border/50 pt-1.5">
-                <span className="text-muted-foreground">API Key</span>
-                <span className="font-mono text-xs truncate">
-                  {credential.maskedApiKey}
-                </span>
-              </div>
-            )}
-            {credential.hasProxy && (
-              <div className="flex w-full items-center justify-between gap-2">
-                <span className="text-muted-foreground">代理</span>
-                <span className="font-mono text-xs truncate">
-                  {maskProxyUrl(credential.proxyUrl ?? "")}
-                </span>
+            {(credential.maskedApiKey || credential.hasProxy) && (
+              <div className="flex w-full items-center gap-3 border-t border-border/40 pt-1 text-[11px] text-muted-foreground">
+                {credential.maskedApiKey && (
+                  <span className="flex min-w-0 items-center gap-1">
+                    Key
+                    <span className="truncate font-mono">
+                      {credential.maskedApiKey}
+                    </span>
+                  </span>
+                )}
+                {credential.hasProxy && (
+                  <span
+                    className="flex min-w-0 items-center gap-1"
+                    title={maskProxyUrl(credential.proxyUrl ?? "")}
+                  >
+                    代理
+                    <span className="truncate font-mono">
+                      {maskProxyUrl(credential.proxyUrl ?? "")}
+                    </span>
+                  </span>
+                )}
               </div>
             )}
           </div>
 
           {/* 余额面板 */}
           <div
-            className={`flex min-h-[120px] flex-col rounded-xl border p-3 transition-colors ${
+            className={`flex min-h-[104px] flex-col rounded-xl border p-2.5 transition-colors ${
               isQuotaExceeded || disabledByQuota
                 ? "border-amber-500/40 bg-amber-50/60 dark:bg-amber-500/[0.06]"
                 : "border-border/60 bg-secondary/40"
@@ -774,7 +791,7 @@ export function CredentialCard({
                   (overageAmount / OVERAGE_CAP) * 100,
                 );
                 return (
-                  <div className="flex flex-1 flex-col gap-3">
+                  <div className="flex flex-1 flex-col gap-2.5">
                     {/* 主行：剩余 / 超额金额（与标签同基线） */}
                     <div className="flex items-baseline justify-between gap-3">
                       <div className="flex items-baseline gap-2 min-w-0">

@@ -40,6 +40,9 @@ pub struct CredentialStatusItem {
     pub expires_at: Option<String>,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 身份提供商（登录方式：Google / Github / Enterprise 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）

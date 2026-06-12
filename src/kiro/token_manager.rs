@@ -792,6 +792,8 @@ pub struct CredentialEntrySnapshot {
     pub total_failure_count: u64,
     /// 认证方式
     pub auth_method: Option<String>,
+    /// 身份提供商（登录方式：Google / Github / Enterprise 等）
+    pub provider: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
     /// Token 过期时间
@@ -2105,6 +2107,7 @@ impl MultiTokenManager {
                             }
                         })
                     },
+                    provider: e.credentials.provider.clone(),
                     has_profile_arn: e.credentials.profile_arn.is_some(),
                     expires_at: if e.credentials.is_api_key_credential() {
                         None // API Key 凭据本地不维护过期时间（服务端策略未知）
