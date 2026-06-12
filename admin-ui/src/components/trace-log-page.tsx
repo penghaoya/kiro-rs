@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
   ScrollText,
@@ -11,7 +11,7 @@ import {
   Unplug,
   Settings2,
 } from 'lucide-react'
-import { Card, CardContent } from '@/components/ui/card'
+import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -57,24 +57,24 @@ function outcomeStyle(outcome: string): {
   }
 }
 
-/** 最终状态 → 徽章 */
+/** 状态徽章（紧凑） */
 function StatusBadge({ status }: { status: string }) {
   if (status === 'success')
     return (
-      <Badge variant="success">
+      <Badge variant="success" className="h-6 px-2 text-[11px] font-normal">
         <CheckCircle2 className="mr-1 h-3 w-3" />
         成功
       </Badge>
     )
   if (status === 'interrupted')
     return (
-      <Badge variant="warning">
+      <Badge variant="warning" className="h-6 px-2 text-[11px] font-normal">
         <Unplug className="mr-1 h-3 w-3" />
         中断
       </Badge>
     )
   return (
-    <Badge variant="destructive">
+    <Badge variant="destructive" className="h-6 px-2 text-[11px] font-normal">
       <AlertTriangle className="mr-1 h-3 w-3" />
       失败
     </Badge>
@@ -82,6 +82,19 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 function formatTime(ts: string): string {
+  const d = new Date(ts)
+  if (isNaN(d.getTime())) return ts
+  return d.toLocaleString('zh-CN', {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
+}
+
+function formatTimeFull(ts: string): string {
   const d = new Date(ts)
   if (isNaN(d.getTime())) return ts
   return d.toLocaleString('zh-CN', { hour12: false })
@@ -134,7 +147,7 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
         </span>
       </div>
       {a.errorSnippet && (
-        <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md bg-background/60 p-2 font-mono text-[11px] text-muted-foreground">
+        <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-all rounded-md bg-background/60 p-2 font-mono text-[11px] text-muted-foreground">
           {a.errorSnippet}
         </pre>
       )}
@@ -143,42 +156,71 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
 }
 
 /** 可展开的链路行 */
-function TraceRow({ rec }: { rec: TraceRecord }) {
-  const [open, setOpen] = useState(false)
+function TraceRow({
+  rec,
+  open,
+  onToggle,
+}: {
+  rec: TraceRecord
+  open: boolean
+  onToggle: () => void
+}) {
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
   return (
     <>
       <tr
-        className="cursor-pointer border-b border-border/40 hover:bg-accent/40"
-        onClick={() => setOpen((v) => !v)}
+        className={`cursor-pointer border-b border-border/40 transition-colors ${
+          open ? 'bg-accent/30' : 'hover:bg-accent/40'
+        }`}
+        onClick={onToggle}
       >
-        <td className="py-2.5 pl-3 pr-2">
+        <td className="w-8 py-2 pl-2 pr-0 text-center">
           {open ? (
-            <ChevronDown className="h-4 w-4 text-muted-foreground" />
+            <ChevronDown className="mx-auto h-3.5 w-3.5 text-muted-foreground" />
           ) : (
-            <ChevronRight className="h-4 w-4 text-muted-foreground" />
+            <ChevronRight className="mx-auto h-3.5 w-3.5 text-muted-foreground" />
           )}
         </td>
-        <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground whitespace-nowrap">
+        <td
+          className="py-2 pr-2 text-xs tabular-nums text-muted-foreground whitespace-nowrap"
+          title={formatTimeFull(rec.ts)}
+        >
           {formatTime(rec.ts)}
         </td>
-        <td className="py-2.5 pr-3 text-[13px]">
-          <span className="truncate">{rec.model}</span>
-          {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
+        <td className="py-2 pr-2 text-xs text-muted-foreground">
+          <div className="flex items-center gap-1 overflow-hidden">
+            <span className="truncate font-medium" title={rec.model}>
+              {rec.model}
+            </span>
+            {rec.isStream && (
+              <Badge variant="outline" className="shrink-0 h-5 px-1.5 text-[10px]">
+                流
+              </Badge>
+            )}
+          </div>
         </td>
-        <td className="py-2.5 pr-3">
+        <td className="py-2 pr-2 whitespace-nowrap">
           <StatusBadge status={rec.finalStatus} />
         </td>
-        <td className="py-2.5 pr-3 text-[13px]">
+        <td
+          className="py-2 pr-2 text-xs text-foreground/90 whitespace-nowrap"
+          title={credLabel(rec.finalCredentialId, rec.finalEmail)}
+        >
           {credLabel(rec.finalCredentialId, rec.finalEmail)}
         </td>
-        <td className="py-2.5 pr-3">
-          {errStyle ? <Badge variant={errStyle.variant}>{errStyle.label}</Badge> : '—'}
+        <td className="py-2 pr-2 whitespace-nowrap hidden lg:table-cell">
+          {errStyle ? (
+            <Badge variant={errStyle.variant} className="h-6 px-2 text-[11px] font-normal">
+              {errStyle.label}
+            </Badge>
+          ) : (
+            <span className="text-xs text-muted-foreground/60">—</span>
+          )}
         </td>
-        <td className="py-2.5 pr-3 text-[13px] tabular-nums">
+        <td className="py-2 pr-2 text-xs tabular-nums text-center text-muted-foreground">
           {Math.max(0, rec.totalAttempts - 1)}
         </td>
-        <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
+        <td className="py-2 pr-3 text-xs tabular-nums text-muted-foreground whitespace-nowrap text-right">
           {formatDuration(rec.durationMs)}
         </td>
       </tr>
@@ -223,20 +265,25 @@ function ExpandedDetail({ rec }: { rec: TraceRecord }) {
 }
 
 /** 下拉筛选器 */
-function Select({
+function FilterSelect({
   value,
   onChange,
   options,
+  className,
 }: {
   value: string
   onChange: (v: string) => void
   options: { value: string; label: string }[]
+  className?: string
 }) {
   return (
     <select
       value={value}
       onChange={(e) => onChange(e.target.value)}
-      className="h-8 rounded-md border border-border/70 bg-background px-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-ring"
+      className={
+        className ??
+        'h-8 min-w-0 rounded-md border border-border/70 bg-background px-2 text-xs focus:outline-none focus:ring-2 focus:ring-ring'
+      }
     >
       {options.map((o) => (
         <option key={o.value} value={o.value}>
@@ -359,58 +406,162 @@ function GovernanceButton() {
 }
 
 
-const PAGE_SIZE = 50
+const PAGE_SIZE_OPTIONS = [10, 15, 20, 30] as const
+const DEFAULT_PAGE_SIZE = 15
+const STORAGE_KEY = 'tracesPageSize'
+
+function readPageSize(): number {
+  const saved = Number(localStorage.getItem(STORAGE_KEY))
+  return PAGE_SIZE_OPTIONS.includes(saved as (typeof PAGE_SIZE_OPTIONS)[number])
+    ? saved
+    : DEFAULT_PAGE_SIZE
+}
+
+function TracePaginationBar({
+  page,
+  totalPages,
+  total,
+  pageSize,
+  isFetching,
+  onPageChange,
+  onPageSizeChange,
+}: {
+  page: number
+  totalPages: number
+  total: number
+  pageSize: number
+  isFetching: boolean
+  onPageChange: (page: number) => void
+  onPageSizeChange: (size: number) => void
+}) {
+  const from = total === 0 ? 0 : page * pageSize + 1
+  const to = Math.min(total, (page + 1) * pageSize)
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border/60 bg-muted/20 px-4 py-2.5">
+      <div className="text-xs text-muted-foreground tabular-nums">
+        {total > 0 ? (
+          <>
+            显示 <span className="font-medium text-foreground">{from}–{to}</span>
+            <span className="mx-1.5 text-muted-foreground/40">/</span>
+            共 {total} 条
+          </>
+        ) : (
+          '暂无数据'
+        )}
+        {isFetching && (
+          <span className="ml-2 inline-flex items-center gap-1 text-muted-foreground/80">
+            <RefreshCw className="h-3 w-3 animate-spin" />
+            更新中
+          </span>
+        )}
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <select
+          className="h-8 rounded-md border border-input bg-background px-2 text-xs text-muted-foreground"
+          value={pageSize}
+          onChange={(e) => onPageSizeChange(Number(e.target.value))}
+          title="每页条数"
+        >
+          {PAGE_SIZE_OPTIONS.map((n) => (
+            <option key={n} value={n}>
+              {n} 条/页
+            </option>
+          ))}
+        </select>
+        <div className="flex items-center gap-1">
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-8 w-8"
+            onClick={() => onPageChange(Math.max(0, page - 1))}
+            disabled={page === 0 || isFetching}
+            title="上一页"
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </Button>
+          <span className="min-w-[4.5rem] text-center text-xs tabular-nums text-muted-foreground">
+            {page + 1} / {totalPages}
+          </span>
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-8 w-8"
+            onClick={() => onPageChange(Math.min(totalPages - 1, page + 1))}
+            disabled={page >= totalPages - 1 || isFetching}
+            title="下一页"
+          >
+            <ChevronRight className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 export function TraceLogPage() {
+  const tableScrollRef = useRef<HTMLDivElement>(null)
   const [status, setStatus] = useState('')
   const [errorType, setErrorType] = useState('')
   const [onlyFailed, setOnlyFailed] = useState(false)
   const [page, setPage] = useState(0)
+  const [pageSize, setPageSize] = useState(readPageSize)
+  const [expandedTraceId, setExpandedTraceId] = useState<string | null>(null)
 
   // 筛选条件变化时回到第一页
   const resetTo = <T,>(setter: (v: T) => void) => (v: T) => {
     setter(v)
     setPage(0)
+    setExpandedTraceId(null)
   }
 
   const query: TraceQuery = {
     status: status || undefined,
     errorType: errorType || undefined,
     onlyFailed: onlyFailed || undefined,
-    limit: PAGE_SIZE,
-    offset: page * PAGE_SIZE,
+    limit: pageSize,
+    offset: page * pageSize,
   }
   const { data, isLoading, isFetching, refetch } = useTraces(query)
   const records = data?.records ?? []
   const total = data?.total ?? 0
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+
+  const goToPage = (next: number) => {
+    setPage(next)
+    setExpandedTraceId(null)
+    tableScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  const handlePageSizeChange = (size: number) => {
+    setPageSize(size)
+    setPage(0)
+    setExpandedTraceId(null)
+    localStorage.setItem(STORAGE_KEY, String(size))
+    tableScrollRef.current?.scrollTo({ top: 0 })
+  }
 
   return (
-    <div className="space-y-5">
-      {/* 筛选栏 */}
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="flex items-center gap-2">
-          <ScrollText className="h-5 w-5 text-muted-foreground" />
-          <h2 className="text-lg font-semibold tracking-tight">请求日志</h2>
-          {total > 0 && <Badge variant="secondary">{total}</Badge>}
+    <div className="space-y-4 animate-fade-in">
+      {/* 页头：与其它 Tab 一致 */}
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex items-start gap-2.5">
+          <ScrollText className="mt-0.5 h-5 w-5 text-muted-foreground" />
+          <div>
+            <div className="flex items-center gap-2">
+              <h1 className="text-lg font-semibold tracking-tight">请求日志</h1>
+              {total > 0 && (
+                <Badge variant="secondary" className="h-5 px-2 text-[11px] font-normal">
+                  {total} 条
+                </Badge>
+              )}
+            </div>
+            <p className="mt-0.5 text-sm text-muted-foreground">
+              查看每次 API 调用的重试链路与失败原因，每 5 秒自动刷新
+            </p>
+          </div>
         </div>
-        <div className="ml-auto flex flex-wrap items-center gap-2">
-          <Select value={status} onChange={resetTo(setStatus)} options={STATUS_OPTIONS} />
-          <Select
-            value={errorType}
-            onChange={resetTo(setErrorType)}
-            options={ERROR_TYPE_OPTIONS}
-          />
-          <Button
-            size="sm"
-            variant={onlyFailed ? 'default' : 'outline'}
-            onClick={() => {
-              setOnlyFailed((v) => !v)
-              setPage(0)
-            }}
-          >
-            只看失败
-          </Button>
+        <div className="flex items-center gap-2">
           <GovernanceButton />
           <Button size="sm" variant="outline" onClick={() => refetch()} disabled={isFetching}>
             <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
@@ -419,67 +570,126 @@ export function TraceLogPage() {
         </div>
       </div>
 
-      <Card>
-        <CardContent className="p-0">
-          {isLoading ? (
-            <div className="p-6 text-sm text-muted-foreground">加载中…</div>
-          ) : records.length === 0 ? (
-            <div className="p-6 text-sm text-muted-foreground">
-              暂无记录。发起几次 /v1/messages 请求后即可看到链路。
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left">
-                <thead>
-                  <tr className="border-b border-border/60 text-[12px] uppercase tracking-wider text-muted-foreground">
-                    <th className="py-2 pl-3 pr-2 font-medium"></th>
-                    <th className="py-2 pr-3 font-medium">时间</th>
-                    <th className="py-2 pr-3 font-medium">模型</th>
-                    <th className="py-2 pr-3 font-medium">状态</th>
-                    <th className="py-2 pr-3 font-medium">最终凭据</th>
-                    <th className="py-2 pr-3 font-medium">错误类型</th>
-                    <th className="py-2 pr-3 font-medium">重试</th>
-                    <th className="py-2 pr-3 font-medium">耗时</th>
+      {/* 单卡片：筛选 + 表格 + 底部分页 */}
+      <Card className="overflow-hidden border-border/60 shadow-sm">
+        <div className="flex flex-wrap items-center gap-2 border-b border-border/60 bg-muted/10 px-3 py-2.5 sm:px-4">
+          <FilterSelect
+            value={status}
+            onChange={resetTo(setStatus)}
+            options={STATUS_OPTIONS}
+            className="h-8 w-[108px] rounded-md border border-border/70 bg-background px-2 text-xs"
+          />
+          <FilterSelect
+            value={errorType}
+            onChange={resetTo(setErrorType)}
+            options={ERROR_TYPE_OPTIONS}
+            className="h-8 min-w-[120px] max-w-[140px] rounded-md border border-border/70 bg-background px-2 text-xs"
+          />
+          <Button
+            size="sm"
+            variant={onlyFailed ? 'default' : 'outline'}
+            className="h-8 text-xs"
+            onClick={() => {
+              setOnlyFailed((v) => !v)
+              setPage(0)
+              setExpandedTraceId(null)
+            }}
+          >
+            只看失败
+          </Button>
+          {(status || errorType || onlyFailed) && (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-8 text-xs text-muted-foreground"
+              onClick={() => {
+                setStatus('')
+                setErrorType('')
+                setOnlyFailed(false)
+                setPage(0)
+                setExpandedTraceId(null)
+              }}
+            >
+              清除筛选
+            </Button>
+          )}
+        </div>
+
+        {isLoading ? (
+          <div className="p-8 text-center text-sm text-muted-foreground">加载中…</div>
+        ) : records.length === 0 ? (
+          <div className="p-8 text-center text-sm text-muted-foreground">
+            暂无记录。发起几次 /v1/messages 请求后即可看到链路。
+          </div>
+        ) : (
+          <>
+            <div
+              ref={tableScrollRef}
+              className="max-h-[min(480px,calc(100vh-16.5rem))] overflow-auto"
+            >
+              <table className="w-full min-w-[920px] table-fixed text-left">
+                <colgroup>
+                  <col style={{ width: 28 }} />
+                  <col style={{ width: 104 }} />
+                  <col style={{ width: '20%' }} />
+                  <col style={{ width: 68 }} />
+                  <col style={{ width: '36%' }} />
+                  <col style={{ width: 76 }} />
+                  <col style={{ width: 36 }} />
+                  <col style={{ width: 48 }} />
+                </colgroup>
+                <thead className="sticky top-0 z-10 bg-card/95 backdrop-blur-sm">
+                  <tr className="border-b border-border/60 text-[11px] text-muted-foreground">
+                    <th className="py-2 pl-2 font-medium" />
+                    <th className="py-2 pr-2 font-medium">时间</th>
+                    <th className="py-2 pr-2 font-medium">模型</th>
+                    <th className="py-2 pr-2 font-medium">状态</th>
+                    <th className="py-2 pr-2 font-medium">凭据</th>
+                    <th className="py-2 pr-2 font-medium hidden lg:table-cell">错误</th>
+                    <th className="py-2 pr-2 font-medium text-center">重试</th>
+                    <th className="py-2 pr-3 font-medium text-right">耗时</th>
                   </tr>
                 </thead>
-                <tbody>
+                <tbody className={isFetching ? 'opacity-60 transition-opacity' : undefined}>
                   {records.map((rec) => (
-                    <TraceRow key={rec.traceId} rec={rec} />
+                    <TraceRow
+                      key={rec.traceId}
+                      rec={rec}
+                      open={expandedTraceId === rec.traceId}
+                      onToggle={() =>
+                        setExpandedTraceId((id) =>
+                          id === rec.traceId ? null : rec.traceId,
+                        )
+                      }
+                    />
                   ))}
                 </tbody>
               </table>
             </div>
-          )}
-        </CardContent>
-      </Card>
+            <TracePaginationBar
+              page={page}
+              totalPages={totalPages}
+              total={total}
+              pageSize={pageSize}
+              isFetching={isFetching}
+              onPageChange={goToPage}
+              onPageSizeChange={handlePageSizeChange}
+            />
+          </>
+        )}
 
-      {total > PAGE_SIZE && (
-        <div className="flex items-center justify-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setPage((p) => Math.max(0, p - 1))}
-            disabled={page === 0 || isFetching}
-          >
-            <ChevronLeft className="h-3.5 w-3.5" />
-            上一页
-          </Button>
-          <div className="px-3 text-sm tabular-nums text-muted-foreground">
-            第 <span className="font-medium text-foreground">{page + 1}</span> /{' '}
-            {totalPages} 页
-            <span className="mx-1.5 text-muted-foreground/50">·</span>共 {total} 条
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
-            disabled={page >= totalPages - 1 || isFetching}
-          >
-            下一页
-            <ChevronRight className="h-3.5 w-3.5" />
-          </Button>
-        </div>
-      )}
+        {!isLoading && records.length === 0 && total > 0 && (
+          <TracePaginationBar
+            page={page}
+            totalPages={totalPages}
+            total={total}
+            pageSize={pageSize}
+            isFetching={isFetching}
+            onPageChange={goToPage}
+            onPageSizeChange={handlePageSizeChange}
+          />
+        )}
+      </Card>
     </div>
   )
 }
