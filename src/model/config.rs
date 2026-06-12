@@ -451,7 +451,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// 获取默认配置文件路径
+    /// 默认配置文件名（实际默认路径为 `<data-dir>/config.json`）
     pub fn default_config_path() -> &'static str {
         "config.json"
     }

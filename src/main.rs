@@ -57,13 +57,14 @@ async fn main() {
         )
         .init();
 
-    // 解析配置/凭证路径
+    // 解析配置/凭证路径（约定优于配置：默认全部落在 data 目录下）
+    let data_dir = std::path::PathBuf::from(&args.data_dir);
     let config_path = args
         .config
-        .unwrap_or_else(|| Config::default_config_path().to_string());
+        .unwrap_or_else(|| resolve_data_file(&data_dir, Config::default_config_path()));
     let credentials_path = args
         .credentials
-        .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+        .unwrap_or_else(|| resolve_data_file(&data_dir, KiroCredentials::default_credentials_path()));
 
     // 文件不存在时自动初始化（Docker 首次部署友好）
     ensure_config_files(&config_path, &credentials_path);
@@ -367,6 +368,26 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+/// 计算数据目录下默认文件的路径。
+///
+/// 兼容旧版布局：若数据目录下不存在该文件、但进程当前目录存在同名旧文件，
+/// 则继续使用旧文件并提示迁移，避免老部署升级后凭据"凭空消失"。
+fn resolve_data_file(data_dir: &std::path::Path, file_name: &str) -> String {
+    let preferred = data_dir.join(file_name);
+    if !preferred.exists() {
+        let legacy = std::path::Path::new(file_name);
+        if legacy.exists() {
+            tracing::warn!(
+                "检测到旧版根目录文件 {}，本次继续使用；建议迁移到 {}（直接移动文件即可）",
+                legacy.display(),
+                preferred.display()
+            );
+            return file_name.to_string();
+        }
+    }
+    preferred.to_string_lossy().into_owned()
 }
 
 /// 文件不存在时初始化配置/凭证文件

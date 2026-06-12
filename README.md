@@ -128,7 +128,9 @@ cargo build --release
 
 ### 2. 最小配置
 
-创建 `config.json`：
+> 约定优于配置：所有配置与运行时数据默认存放在 `data/` 目录（可用 `--data-dir` 或环境变量 `KIRO_DATA_DIR` 更换）。直接启动即可自动生成 `data/config.json`（含随机密钥）与空的 `data/credentials.json`，也可以按下面的说明手动创建。
+
+创建 `data/config.json`：
 
 ```json
 {
@@ -140,7 +142,7 @@ cargo build --release
 ```
 > PS: 如果你需要 Web 管理面板, 请注意配置 `adminApiKey`
 
-创建 `credentials.json`（从 Kiro IDE 等中获取凭证信息）：
+创建 `data/credentials.json`（从 Kiro IDE 等中获取凭证信息）：
 > PS: 可以前往 Web 管理面板配置跳过本步骤
 > 如果你对凭据地域有疑惑, 请查看 [Region 配置](#region-配置)
 
@@ -170,11 +172,17 @@ IdC 认证：
 ./target/release/kiro-rs
 ```
 
-或指定配置文件路径：
+默认读写 `data/` 目录。如需更换数据目录或单独指定文件路径：
 
 ```bash
+# 更换数据目录（也可用环境变量 KIRO_DATA_DIR）
+./target/release/kiro-rs --data-dir /path/to/data
+
+# 单独覆盖配置/凭证文件路径
 ./target/release/kiro-rs -c /path/to/config.json --credentials /path/to/credentials.json
 ```
+
+> 从旧版本升级：若根目录仍存在旧的 `config.json` / `credentials.json`，启动时会继续使用并提示迁移，直接把它们移入 `data/` 即可。
 
 ### 4. 验证
 

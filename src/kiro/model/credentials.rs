@@ -272,7 +272,7 @@ impl KiroCredentials {
     /// 特殊值：显式不使用代理
     pub const PROXY_DIRECT: &'static str = "direct";
 
-    /// 获取默认凭证文件路径
+    /// 默认凭证文件名（实际默认路径为 `<data-dir>/credentials.json`）
     pub fn default_credentials_path() -> &'static str {
         "credentials.json"
     }
