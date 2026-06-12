@@ -741,13 +741,17 @@ export function CredentialCard({
                 : "border-border/60 bg-secondary/40"
             }`}
           >
-            {loadingBalance ? (
-              <div className="flex flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                正在查询余额…
-              </div>
-            ) : balance ? (
-              (() => {
+            {balance ? (
+              // 刷新中不整块替换为 spinner（会闪烁/跳动），而是原位降低透明度 + 角标小动画
+              <div
+                className={`relative flex flex-1 flex-col transition-opacity duration-300 ${
+                  loadingBalance ? "opacity-60" : "opacity-100"
+                }`}
+              >
+                {loadingBalance && (
+                  <Loader2 className="absolute right-0 top-0 z-10 h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                )}
+                {(() => {
                 const used = balance.currentUsage;
                 const limit = balance.usageLimit;
                 const overLimit = limit > 0 && used > limit;
@@ -853,7 +857,13 @@ export function CredentialCard({
                     </div>
                   </div>
                 );
-              })()
+                })()}
+              </div>
+            ) : loadingBalance ? (
+              <div className="flex flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                正在查询余额…
+              </div>
             ) : (
               <div className="flex flex-1 items-center justify-center text-center text-[13px] text-muted-foreground">
                 余额未查询，点击顶部"刷新当前页余额"即可加载。

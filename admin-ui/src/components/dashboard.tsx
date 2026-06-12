@@ -499,19 +499,33 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   }).length;
 
   /**
-   * 取"本地手动刷新快照"与"服务端缓存余额"中较新的一份。
-   * 旧实现本地快照永远优先，会遮蔽服务端后续更新（如切换超额后的预热结果），
-   * 导致开关状态与真实行为不一致。
+   * 余额展示统一走 balanceMap（最后已知值）。
+   * 服务端余额缓存 TTL 只有 5 分钟，过期后列表响应不再携带 balance 字段；
+   * 这里把见过的服务端余额合并进 balanceMap 持久保留，避免额度面板
+   * 在缓存过期后"莫名消失"。新旧数据按时间戳竞争，永远展示较新的一份。
    */
+  useEffect(() => {
+    if (!data?.credentials) return;
+    setBalanceMap((prev) => {
+      let changed = false;
+      const n = new Map(prev);
+      for (const c of data.credentials) {
+        if (!c.balance) continue;
+        const serverAtMs = (c.balanceUpdatedAt ?? 0) * 1000 || Date.now();
+        const existing = n.get(c.id);
+        if (!existing || serverAtMs > existing.fetchedAt) {
+          n.set(c.id, { data: c.balance, fetchedAt: serverAtMs });
+          changed = true;
+        }
+      }
+      return changed ? n : prev;
+    });
+  }, [data]);
+
   const getEffectiveBalance = (
     c: CredentialStatusItem,
   ): BalanceResponse | null => {
-    const local = balanceMap.get(c.id);
-    if (local && c.balance) {
-      const serverAtMs = (c.balanceUpdatedAt ?? 0) * 1000;
-      return local.fetchedAt >= serverAtMs ? local.data : c.balance;
-    }
-    return local?.data ?? c.balance ?? null;
+    return balanceMap.get(c.id)?.data ?? c.balance ?? null;
   };
 
   // 已超额且尚未禁用的数量（用于一键超额按钮）
