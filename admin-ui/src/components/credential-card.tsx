@@ -522,8 +522,8 @@ export function CredentialCard({
                       ? "ring-1 ring-amber-500/60"
                       : ""
         } ${
-          // 其他原因被禁用：灰化去色（额度禁用保留可读性，方便审视）
-          credential.disabled && !disabledByQuota ? "opacity-60 grayscale" : ""
+          // 禁用或已封顶的账号统一灰化去色：一眼即知不可用
+          credential.disabled || isCapped ? "opacity-60 grayscale" : ""
         }`}
       >
         <CardHeader className="p-3.5 pb-2">
