@@ -118,7 +118,7 @@ function App() {
               className="h-9 w-9 object-contain"
               draggable={false}
             />
-            <span className="font-semibold tracking-tight">Kiro Admin</span>
+            <span className="font-semibold tracking-tight">Kiro-Kfc</span>
             <div className="ml-4 hidden sm:flex items-center gap-1 rounded-full border border-border/60 p-0.5">
               {TABS.map((t) => (
                 <Button

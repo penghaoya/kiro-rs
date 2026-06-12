@@ -1170,7 +1170,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 className="h-10 w-10 object-contain"
                 draggable={false}
               />
-              <span className="font-semibold tracking-tight">Kiro Admin</span>
+              <span className="font-semibold tracking-tight">Kiro-Kfc</span>
             </div>
             <div className="flex items-center gap-1.5">
               <Button

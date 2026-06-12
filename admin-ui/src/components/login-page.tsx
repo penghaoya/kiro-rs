@@ -50,7 +50,7 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               draggable={false}
             />
             <h1 className="text-[22px] font-semibold tracking-tight">
-              Kiro Admin
+              Kiro-Kfc
             </h1>
             <p className="mt-1 text-sm text-muted-foreground">
               使用 Admin API Key 登录管理面板
