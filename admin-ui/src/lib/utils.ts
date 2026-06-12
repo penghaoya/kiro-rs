@@ -165,6 +165,25 @@ export function formatCredits(value: number | null | undefined): string {
 }
 
 /**
+ * 邮箱脱敏（隐私模式）：user12345@example.com -> us***45@***.com
+ * 非邮箱格式（无 @）按昵称规则脱敏。
+ */
+export function maskEmail(email: string): string {
+  if (!email) return email
+  const maskPart = (s: string): string => {
+    if (s.length <= 2) return '*'.repeat(s.length)
+    if (s.length <= 4) return s[0] + '***'
+    return s.slice(0, 2) + '***' + s.slice(-2)
+  }
+  const at = email.indexOf('@')
+  if (at < 0) return maskPart(email)
+  const local = email.slice(0, at)
+  const domain = email.slice(at + 1)
+  const tld = domain.split('.').pop() || ''
+  return `${maskPart(local)}@***.${tld}`
+}
+
+/**
  * 脱敏代理 URL：将 user:pass@host 中的认证信息替换为 xxx****xxx
  */
 export function maskProxyUrl(url: string): string {

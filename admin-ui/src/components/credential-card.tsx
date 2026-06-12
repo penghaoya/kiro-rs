@@ -41,7 +41,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { CredentialStatusItem, BalanceResponse } from "@/types/api";
-import { maskProxyUrl, extractErrorMessage } from "@/lib/utils";
+import { maskProxyUrl, maskEmail, extractErrorMessage } from "@/lib/utils";
 import {
   useSetDisabled,
   useSetPriority,
@@ -68,6 +68,8 @@ interface CredentialCardProps {
   selected: boolean;
   onToggleSelect: () => void;
   balance: BalanceResponse | null;
+  /** 隐私模式：邮箱脱敏展示（复制仍为明文） */
+  privacyMode?: boolean;
   loadingBalance: boolean;
   onRefreshBalance: () => void | Promise<void>;
   /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
@@ -206,6 +208,7 @@ export function CredentialCard({
   selected,
   onToggleSelect,
   balance,
+  privacyMode = false,
   loadingBalance,
   onRefreshBalance,
   failureStats,
@@ -417,6 +420,9 @@ export function CredentialCard({
   const isRateLimited = !credential.disabled && rateLimitRemainingMs > 0;
 
   const displayName = credential.email || `凭据 #${credential.id}`;
+  // 隐私模式只影响展示，复制仍是明文
+  const shownName =
+    privacyMode && credential.email ? maskEmail(credential.email) : displayName;
   const handleCopyName = async () => {
     try {
       await navigator.clipboard.writeText(displayName);
@@ -523,7 +529,7 @@ export function CredentialCard({
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1">
                 <CardTitle className="truncate text-[14px]">
-                  {displayName}
+                  {shownName}
                 </CardTitle>
                 <button
                   type="button"
@@ -1092,7 +1098,11 @@ export function CredentialCard({
         open={showFailuresDialog}
         onOpenChange={setShowFailuresDialog}
         credentialId={credential.id}
-        email={credential.email}
+        email={
+          privacyMode && credential.email
+            ? maskEmail(credential.email)
+            : credential.email
+        }
       />
       <AvailableModelsDialog
         open={showModelsDialog}

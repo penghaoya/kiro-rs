@@ -375,6 +375,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [balanceMap, setBalanceMap] = useState<
     Map<number, { data: BalanceResponse; fetchedAt: number }>
   >(new Map());
+  /** 隐私模式：列表邮箱脱敏展示（适合录屏/分享场景），选择持久化到本地 */
+  const [privacyMode, setPrivacyMode] = useState<boolean>(
+    () => localStorage.getItem("privacyMode") === "1",
+  );
+  const togglePrivacyMode = () => {
+    setPrivacyMode((v) => {
+      const next = !v;
+      localStorage.setItem("privacyMode", next ? "1" : "0");
+      return next;
+    });
+  };
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(
     new Set(),
   );
@@ -1318,6 +1329,21 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             {data?.credentials && data.credentials.length > 0 && (
               <Badge variant="secondary">{data.credentials.length}</Badge>
             )}
+            <Button
+              size="icon"
+              variant="ghost"
+              className="h-8 w-8"
+              onClick={togglePrivacyMode}
+              title={
+                privacyMode ? "隐私模式已开启（邮箱脱敏），点击显示明文" : "开启隐私模式（邮箱脱敏展示）"
+              }
+            >
+              {privacyMode ? (
+                <EyeOff className="h-4 w-4 text-primary" />
+              ) : (
+                <Eye className="h-4 w-4 text-muted-foreground" />
+              )}
+            </Button>
             {currentCredentials.length > 0 && (
               <Button
                 size="sm"
@@ -1586,6 +1612,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       selected={selectedIds.has(credential.id)}
                       onToggleSelect={() => toggleSelect(credential.id)}
                       balance={getEffectiveBalance(credential)}
+                      privacyMode={privacyMode}
                       loadingBalance={loadingBalanceIds.has(credential.id)}
                       onRefreshBalance={() =>
                         handleRefreshBalance(credential.id)
