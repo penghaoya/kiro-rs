@@ -187,11 +187,15 @@ export interface ProxyPoolResponse {
 export interface AddProxyRequest {
   url: string
   label?: string
+  /** 无协议简写时的默认协议 */
+  defaultScheme?: 'http' | 'https' | 'socks5' | 'socks4'
 }
 
 // 批量添加代理请求
 export interface BatchAddProxyRequest {
   urls: string[]
+  /** 无协议简写时的默认协议 */
+  defaultScheme?: 'http' | 'https' | 'socks5' | 'socks4'
 }
 
 // 分配代理给凭据请求

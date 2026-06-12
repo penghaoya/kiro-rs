@@ -76,7 +76,6 @@ import {
   BatchVerifyDialog,
   type VerifyResult,
 } from "@/components/batch-verify-dialog";
-import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
 import { ImageUpdateDialog } from "@/components/image-update-dialog";
 import {
   useCredentials,
@@ -353,7 +352,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false);
-  const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
   const [imageUpdateDialogOpen, setImageUpdateDialogOpen] = useState(false);
   const [adminKeyDialogOpen, setAdminKeyDialogOpen] = useState(false);
   const [newAdminKey, setNewAdminKey] = useState("");
@@ -1502,9 +1500,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuLabel>维护</DropdownMenuLabel>
-                <DropdownMenuItem onSelect={() => setProxyPoolDialogOpen(true)}>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    window.location.hash = "#/proxies";
+                  }}
+                >
                   <Globe />
-                  IP 代理池管理
+                  代理池管理
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   disabled={
@@ -1709,10 +1711,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       <KamImportDialog
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
-      />
-      <ProxyPoolDialog
-        open={proxyPoolDialogOpen}
-        onOpenChange={setProxyPoolDialogOpen}
       />
       <ImageUpdateDialog
         open={imageUpdateDialogOpen}

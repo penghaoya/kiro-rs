@@ -4,7 +4,7 @@ import { useDarkMode } from "@/hooks/use-dark-mode";
 import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, Globe } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -39,7 +39,13 @@ const TraceLogPage = lazy(() =>
   })),
 );
 
-type Tab = "overview" | "credentials" | "keys" | "traces";
+const ProxyPoolPage = lazy(() =>
+  import("@/components/proxy-pool-page").then((m) => ({
+    default: m.ProxyPoolPage,
+  })),
+);
+
+type Tab = "overview" | "credentials" | "proxies" | "keys" | "traces";
 
 const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
   {
@@ -51,6 +57,11 @@ const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
     key: "credentials",
     label: "凭据管理",
     icon: <Server className="h-3.5 w-3.5" />,
+  },
+  {
+    key: "proxies",
+    label: "代理池",
+    icon: <Globe className="h-3.5 w-3.5" />,
   },
   {
     key: "keys",
@@ -66,7 +77,7 @@ const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
 
 function readTabFromHash(): Tab {
   const h = window.location.hash.replace(/^#\/?/, "");
-  if (h === "credentials" || h === "keys" || h === "overview" || h === "traces")
+  if (h === "credentials" || h === "keys" || h === "overview" || h === "traces" || h === "proxies")
     return h;
   return "overview";
 }
@@ -196,6 +207,7 @@ function App() {
           {tab === "credentials" && (
             <Dashboard onLogout={handleLogout} embedded />
           )}
+          {tab === "proxies" && <ProxyPoolPage />}
           {tab === "keys" && <ClientKeysPage />}
           {tab === "traces" && <TraceLogPage />}
         </Suspense>
