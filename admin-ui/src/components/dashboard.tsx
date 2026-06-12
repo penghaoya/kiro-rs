@@ -206,11 +206,11 @@ function RetryPolicyPanel() {
   };
 
   return (
-    <div className="mb-5 rounded-xl border border-border/60 bg-card/70 px-4 shadow-apple">
+    <div className="mb-3 rounded-xl border border-border/60 bg-card/70 px-4 shadow-apple">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className="flex w-full items-center gap-2 py-3 text-left"
+        className="flex w-full items-center gap-2 py-2 text-left"
       >
         <Activity className="h-4 w-4 shrink-0 text-primary" />
         <h2 className="shrink-0 text-sm font-semibold tracking-tight">
@@ -401,7 +401,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   });
   const cancelVerifyRef = useRef(false);
   const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 12;
+  /** 每页卡片数：默认 6（3 列 × 2 行，正好一屏不滚动），可选并持久化 */
+  const [itemsPerPage, setItemsPerPage] = useState<number>(() => {
+    const saved = Number(localStorage.getItem("credsPageSize"));
+    return [6, 12, 24].includes(saved) ? saved : 6;
+  });
+  const handleChangePageSize = (size: number) => {
+    setItemsPerPage(size);
+    setCurrentPage(1);
+    localStorage.setItem("credsPageSize", String(size));
+  };
   const { darkMode, toggle: toggleDarkMode } = useDarkMode();
 
   const queryClient = useQueryClient();
@@ -1275,46 +1284,43 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       {/* 主内容 */}
       <main
         ref={gridRef}
-        className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-8"}
+        className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-5"}
       >
-        {/* 大标题 + 概览指标 */}
-        <div className="mb-5 flex flex-wrap items-end justify-between gap-x-8 gap-y-4">
-          <div>
-            <h1 className="text-[28px] font-semibold tracking-tight leading-tight">
+        {/* 标题 + 概览指标：单行紧凑布局，省出纵向空间 */}
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-x-8 gap-y-3">
+          <div className="flex items-baseline gap-3">
+            <h1 className="text-xl font-semibold tracking-tight leading-tight">
               凭据管理
             </h1>
-            <p className="mt-1 text-sm text-muted-foreground">
+            <p className="hidden text-[13px] text-muted-foreground lg:block">
               管理 Kiro 的所有访问凭据、负载均衡与登录信息
             </p>
           </div>
-          <div className="flex items-center gap-6">
-            <div className="flex flex-col">
-              <span className="text-2xl font-semibold leading-none tracking-tight tabular-nums">
+          <div className="flex items-center gap-5">
+            <div className="flex items-baseline gap-1.5">
+              <span className="text-xl font-semibold leading-none tracking-tight tabular-nums">
                 {formatNumber(data?.total)}
               </span>
-              <span className="mt-1.5 text-xs font-medium text-muted-foreground">
-                凭据总数
+              <span className="text-xs font-medium text-muted-foreground">
+                总数
               </span>
             </div>
-            <div className="h-9 w-px bg-border/60" />
-            <div className="flex flex-col">
-              <span className="text-2xl font-semibold leading-none tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400">
+            <div className="h-6 w-px bg-border/60" />
+            <div className="flex items-baseline gap-1.5">
+              <span className="text-xl font-semibold leading-none tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400">
                 {formatNumber(data?.available)}
               </span>
-              <span className="mt-1.5 text-xs font-medium text-muted-foreground">
-                可用凭据
+              <span className="text-xs font-medium text-muted-foreground">
+                可用
               </span>
             </div>
-            <div className="h-9 w-px bg-border/60" />
-            <div className="flex flex-col">
-              <span className="flex items-center gap-1.5 leading-none">
-                <span className="text-2xl font-semibold tracking-tight tabular-nums">
-                  #{data?.currentId || "-"}
-                </span>
-                {data?.currentId && <Badge variant="success">活跃</Badge>}
+            <div className="h-6 w-px bg-border/60" />
+            <div className="flex items-baseline gap-1.5">
+              <span className="text-xl font-semibold leading-none tracking-tight tabular-nums">
+                #{data?.currentId || "-"}
               </span>
-              <span className="mt-1.5 text-xs font-medium text-muted-foreground">
-                当前活跃
+              <span className="text-xs font-medium text-muted-foreground">
+                活跃
               </span>
             </div>
           </div>
@@ -1323,7 +1329,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         <RetryPolicyPanel />
 
         {/* 工具栏 */}
-        <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">
             <h2 className="text-lg font-semibold tracking-tight">凭据列表</h2>
             {data?.credentials && data.credentials.length > 0 && (
@@ -1630,8 +1636,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </SortableContext>
             </DndContext>
 
-            {totalPages > 1 && (
-              <div className="mt-8 flex items-center justify-center gap-2">
+            {(data?.credentials.length || 0) > 6 && (
+              <div className="mt-4 flex items-center justify-center gap-2">
                 <Button
                   variant="outline"
                   size="sm"
@@ -1661,6 +1667,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   下一页
                   <ChevronRight className="h-3.5 w-3.5" />
                 </Button>
+                <select
+                  className="ml-2 h-8 rounded-md border border-input bg-background px-2 text-xs text-muted-foreground"
+                  value={itemsPerPage}
+                  onChange={(e) => handleChangePageSize(Number(e.target.value))}
+                  title="每页展示的卡片数"
+                >
+                  <option value={6}>6 / 页</option>
+                  <option value={12}>12 / 页</option>
+                  <option value={24}>24 / 页</option>
+                </select>
               </div>
             )}
           </>
