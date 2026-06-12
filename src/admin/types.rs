@@ -574,6 +574,9 @@ pub struct AddProxyRequest {
     pub url: String,
     #[serde(default)]
     pub label: Option<String>,
+    /// 无协议简写时的默认协议：http / https / socks5 / socks4
+    #[serde(default)]
+    pub default_scheme: Option<String>,
 }
 
 /// 批量导入代理请求
@@ -582,6 +585,9 @@ pub struct AddProxyRequest {
 pub struct BatchAddProxyRequest {
     /// 代理 URL 列表（每行一个）
     pub urls: Vec<String>,
+    /// 无协议简写时的默认协议：http / https / socks5 / socks4
+    #[serde(default)]
+    pub default_scheme: Option<String>,
 }
 
 /// 分配代理给凭据请求

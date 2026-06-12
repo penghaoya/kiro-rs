@@ -316,7 +316,7 @@ pub async fn add_proxy(
     State(state): State<AdminState>,
     Json(payload): Json<AddProxyRequest>,
 ) -> impl IntoResponse {
-    match state.service.add_proxy(payload.url, payload.label) {
+    match state.service.add_proxy(payload) {
         Ok(entry) => Json(entry).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

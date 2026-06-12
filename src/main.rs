@@ -30,6 +30,7 @@ mod http_client;
 mod image_resize;
 mod kiro;
 mod model;
+mod proxy_url;
 mod security;
 pub mod token;
 

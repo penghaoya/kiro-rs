@@ -23,7 +23,7 @@ use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
     BatchAddProxyRequest, CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse,
-    EnableOverageAllResult, GitHubRateLimitInfo, GlobalConfigResponse, ImageUpdateResponse,
+    AddProxyRequest, EnableOverageAllResult, GitHubRateLimitInfo, GlobalConfigResponse, ImageUpdateResponse,
     KamExportAccount, KamExportResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, RetryPolicyResponse, SetAccountThrottleConfigRequest,
@@ -209,18 +209,26 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
 
 fn validate_proxy_url(url: Option<&str>) -> Result<(), AdminServiceError> {
     if let Some(u) = url {
-        let valid_prefix = u.starts_with("http://")
-            || u.starts_with("https://")
-            || u.starts_with("socks5://")
-            || u.starts_with("socks4://");
-        if !valid_prefix {
-            return Err(AdminServiceError::InvalidCredential(
-                "代理 URL 格式无效，需以 http://、https://、socks5:// 或 socks4:// 开头"
-                    .to_string(),
-            ));
+        if u.eq_ignore_ascii_case("direct") {
+            return Ok(());
         }
+        crate::proxy_url::validate_proxy_url(u).map_err(|e| {
+            AdminServiceError::InvalidCredential(format!(
+                "代理 URL 格式无效: {}",
+                e
+            ))
+        })?;
     }
     Ok(())
+}
+
+fn normalize_proxy_input(
+    url: &str,
+    default_scheme: Option<&str>,
+) -> Result<String, AdminServiceError> {
+    crate::proxy_url::normalize_proxy_url(url, default_scheme).map_err(|e| {
+        AdminServiceError::InvalidCredential(e.to_string())
+    })
 }
 
 fn validate_retention_days(name: &str, days: u32) -> Result<(), AdminServiceError> {
@@ -1231,18 +1239,12 @@ impl AdminService {
 
     /// 设置全局代理 URL（None 表示清除）并持久化到配置文件
     pub fn set_global_proxy(&self, url: Option<String>) -> Result<(), AdminServiceError> {
-        if let Some(ref u) = url {
-            let valid_prefix = u.starts_with("http://")
-                || u.starts_with("https://")
-                || u.starts_with("socks5://")
-                || u.starts_with("socks4://");
-            if !valid_prefix {
-                return Err(AdminServiceError::InvalidCredential(
-                    "代理 URL 格式无效，需以 http://、https://、socks5:// 或 socks4:// 开头"
-                        .to_string(),
-                ));
-            }
-        }
+        let url = match url {
+            Some(u) if u.trim().is_empty() => None,
+            Some(u) => Some(normalize_proxy_input(&u, None)?),
+            None => None,
+        };
+        validate_proxy_url(url.as_deref())?;
 
         let proxy = url.as_deref().map(ProxyConfig::new);
         self.token_manager.set_global_proxy(proxy.clone());
@@ -2415,14 +2417,11 @@ impl AdminService {
     }
 
     /// 添加代理到池中
-    pub fn add_proxy(
-        &self,
-        url: String,
-        label: Option<String>,
-    ) -> Result<ProxyPoolEntry, AdminServiceError> {
+    pub fn add_proxy(&self, req: AddProxyRequest) -> Result<ProxyPoolEntry, AdminServiceError> {
+        let default_scheme = req.default_scheme.as_deref();
         let entry = self
             .proxy_pool
-            .add(url, label)
+            .add(req.url, req.label, default_scheme)
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
         Ok(ProxyPoolEntry {
             id: entry.id,
@@ -2443,7 +2442,8 @@ impl AdminService {
         &self,
         req: BatchAddProxyRequest,
     ) -> (Vec<ProxyPoolEntry>, Vec<String>) {
-        let (added, errors) = self.proxy_pool.batch_add(req.urls);
+        let default_scheme = req.default_scheme.as_deref();
+        let (added, errors) = self.proxy_pool.batch_add(req.urls, default_scheme);
         let result = added
             .into_iter()
             .map(|e| ProxyPoolEntry {

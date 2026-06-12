@@ -7,6 +7,7 @@
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
+use crate::proxy_url::{normalize_proxy_url, validate_proxy_url as validate_normalized_url};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -100,29 +101,6 @@ pub struct ProxyPoolManager {
     tls_backend: TlsBackend,
 }
 
-/// 校验代理 URL 的 scheme 是否合法
-fn validate_proxy_url(url: &str) -> anyhow::Result<()> {
-    let valid_schemes = ["http://", "https://", "socks5://", "socks4://"];
-    if !valid_schemes.iter().any(|s| url.starts_with(s)) {
-        anyhow::bail!(
-            "代理 URL scheme 无效，支持: http/https/socks4/socks5（收到: {}）",
-            url
-        );
-    }
-    // 简单检查 host:port 存在
-    let after_scheme = valid_schemes
-        .iter()
-        .find(|s| url.starts_with(*s))
-        .map(|s| &url[s.len()..])
-        .unwrap_or(url);
-    // after_scheme 可能是 user:pass@host:port 或 host:port
-    let host_part = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
-    if !host_part.contains(':') {
-        anyhow::bail!("代理 URL 缺少端口号: {}", url);
-    }
-    Ok(())
-}
-
 impl ProxyPoolManager {
     pub fn new(path: Option<PathBuf>, tls_backend: TlsBackend) -> Self {
         let entries = path
@@ -145,12 +123,17 @@ impl ProxyPoolManager {
         self.entries.lock().clone()
     }
 
-    pub fn add(&self, url: String, label: Option<String>) -> anyhow::Result<ProxyEntry> {
-        let url = url.trim().to_string();
-        if url.is_empty() {
-            anyhow::bail!("代理 URL 不能为空");
+    pub fn add(
+        &self,
+        url: String,
+        label: Option<String>,
+        default_scheme: Option<&str>,
+    ) -> anyhow::Result<ProxyEntry> {
+        let url = normalize_proxy_url(&url, default_scheme)?;
+        if url.eq_ignore_ascii_case("direct") {
+            anyhow::bail!("代理池不支持 direct，请填写真实代理地址");
         }
-        validate_proxy_url(&url)?;
+        validate_normalized_url(&url)?;
 
         let mut entries = self.entries.lock();
 
@@ -178,17 +161,32 @@ impl ProxyPoolManager {
     }
 
     /// 批量添加：在单次加锁内完成所有插入，最后统一持久化一次
-    pub fn batch_add(&self, urls: Vec<String>) -> (Vec<ProxyEntry>, Vec<String>) {
+    pub fn batch_add(
+        &self,
+        urls: Vec<String>,
+        default_scheme: Option<&str>,
+    ) -> (Vec<ProxyEntry>, Vec<String>) {
         let mut added = vec![];
         let mut errors = vec![];
 
         let mut entries = self.entries.lock();
         for url in urls {
-            let url = url.trim().to_string();
+            let url = url.trim();
             if url.is_empty() || url.starts_with('#') {
                 continue;
             }
-            if let Err(e) = validate_proxy_url(&url) {
+            let url = match normalize_proxy_url(url, default_scheme) {
+                Ok(u) => u,
+                Err(e) => {
+                    errors.push(e.to_string());
+                    continue;
+                }
+            };
+            if url.eq_ignore_ascii_case("direct") {
+                errors.push("代理池不支持 direct".to_string());
+                continue;
+            }
+            if let Err(e) = validate_normalized_url(&url) {
                 errors.push(e.to_string());
                 continue;
             }
@@ -507,7 +505,7 @@ mod tests {
     fn set_enabled_true_clears_auto_disable_state() {
         let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
         let entry = mgr
-            .add("socks5://127.0.0.1:1080".to_string(), None)
+            .add("socks5://127.0.0.1:1080".to_string(), None, None)
             .unwrap();
         // 模拟自动禁用状态
         {
