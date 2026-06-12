@@ -97,6 +97,18 @@ pub struct UsageBreakdown {
     /// 使用限额（精确值）
     #[serde(default)]
     pub usage_limit_with_precision: f64,
+
+    /// 当前超额用量（美元）
+    #[serde(default)]
+    pub current_overages: Option<f64>,
+
+    /// 超额硬上限（美元）
+    #[serde(default)]
+    pub overage_cap: Option<f64>,
+
+    /// 超额已产生的计费金额（美元）
+    #[serde(default)]
+    pub overage_charges: Option<f64>,
 }
 
 /// 奖励额度
@@ -218,6 +230,21 @@ impl UsageLimitsResponse {
     /// 获取第一个使用量明细
     fn primary_breakdown(&self) -> Option<&UsageBreakdown> {
         self.usage_breakdown_list.first()
+    }
+
+    /// 当前超额用量（美元），上游未返回时为 None
+    pub fn overage_used(&self) -> Option<f64> {
+        self.primary_breakdown().and_then(|b| b.current_overages)
+    }
+
+    /// 超额硬上限（美元），上游未返回时为 None
+    pub fn overage_cap(&self) -> Option<f64> {
+        self.primary_breakdown().and_then(|b| b.overage_cap)
+    }
+
+    /// 超额已产生的计费金额（美元），上游未返回时为 None
+    pub fn overage_charges(&self) -> Option<f64> {
+        self.primary_breakdown().and_then(|b| b.overage_charges)
     }
 
     /// 获取总使用限额（精确值）

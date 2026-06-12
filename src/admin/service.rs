@@ -687,6 +687,32 @@ impl AdminService {
         }
         self.save_balance_cache();
 
+        // 封顶（基础额度 + 超额均用尽，或掉订阅无法超额）的账号已无法服务请求：
+        // 自动以 QuotaExceeded 禁用，避免继续参与调度白白吃失败。
+        if balance.capped {
+            let snapshot = self.token_manager.snapshot();
+            let already_disabled = snapshot
+                .entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.disabled)
+                .unwrap_or(true);
+            if !already_disabled {
+                let was_current = snapshot.current_id == id;
+                match self.token_manager.disable_quota_exceeded(id) {
+                    Ok(()) => {
+                        tracing::warn!("凭据 #{} 额度已封顶（基础+超额用尽），自动禁用", id);
+                        if was_current {
+                            let _ = self.token_manager.switch_to_next();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("凭据 #{} 封顶自动禁用失败: {}", id, e);
+                    }
+                }
+            }
+        }
+
         Ok(balance)
     }
 
@@ -742,6 +768,26 @@ impl AdminService {
             0.0
         };
 
+        let overage_enabled = usage.overage_enabled();
+        let overage_used = usage.overage_used();
+        let overage_cap = usage.overage_cap();
+
+        // 封顶判定（对齐 kiro-account-manager 的 isUsageCapped 语义）：
+        // 基础额度用尽后——开了超额且超额还有空间则不算封顶；
+        // 超额也用尽、或没开/不能超额（如掉成 FREE），即为封顶。
+        let base_full = usage_limit > 0.0 && current_usage >= usage_limit;
+        let capped = base_full
+            && if overage_enabled == Some(true) {
+                let used = overage_used.unwrap_or(current_usage - usage_limit);
+                match overage_cap {
+                    Some(cap) if cap > 0.0 => used >= cap,
+                    // 超额已开但上游没给硬上限：无法判断，不算封顶
+                    _ => false,
+                }
+            } else {
+                true
+            };
+
         Ok(BalanceResponse {
             id,
             subscription_title: usage.subscription_title().map(|s| s.to_string()),
@@ -750,12 +796,16 @@ impl AdminService {
             remaining,
             usage_percentage,
             next_reset_at: usage.next_date_reset,
-            overage_enabled: usage.overage_enabled(),
+            overage_enabled,
             overage_capable: usage.overage_capable(),
             overage_capability_raw: usage
                 .subscription_info
                 .as_ref()
                 .and_then(|s| s.overage_capability.clone()),
+            overage_used,
+            overage_cap,
+            overage_charges: usage.overage_charges(),
+            capped,
         })
     }
 

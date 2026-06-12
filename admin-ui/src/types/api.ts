@@ -60,6 +60,14 @@ export interface BalanceResponse {
   overageCapable?: boolean
   /** 上游 overageCapability 原始字符串，用于排查"未知"状态 */
   overageCapabilityRaw?: string
+  /** 当前超额用量（美元） */
+  overageUsed?: number
+  /** 超额硬上限（美元） */
+  overageCap?: number
+  /** 超额已产生的计费金额（美元） */
+  overageCharges?: number
+  /** 已封顶：基础额度用尽且（无超额能力/未开/超额也用尽），刷新时会被自动禁用 */
+  capped?: boolean
 }
 
 // 某凭据当前可用的模型列表响应

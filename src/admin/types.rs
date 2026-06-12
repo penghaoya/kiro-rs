@@ -318,6 +318,19 @@ pub struct BalanceResponse {
     /// 上游 `overageCapability` 原始字符串（用于排查"未知"状态）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overage_capability_raw: Option<String>,
+    /// 当前超额用量（美元，上游 currentOverages）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_used: Option<f64>,
+    /// 超额硬上限（美元，上游 overageCap）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_cap: Option<f64>,
+    /// 超额已产生的计费金额（美元，上游 overageCharges）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_charges: Option<f64>,
+    /// 是否已封顶：基础额度用尽且（无超额能力 / 未开超额 / 超额也用尽）。
+    /// 封顶账号无法再服务请求，刷新余额时会被自动禁用。
+    #[serde(default)]
+    pub capped: bool,
 }
 
 // ============ 可用模型查询 ============

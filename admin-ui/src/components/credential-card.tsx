@@ -429,6 +429,8 @@ export function CredentialCard({
   const isQuotaExceeded = balance
     ? balance.remaining <= 0 || balance.usagePercentage >= 100
     : false;
+  /** 已封顶：基础额度 + 超额均用尽（或无超额能力），后端刷新余额时会自动禁用 */
+  const isCapped = balance?.capped === true;
 
   const disabledByQuota =
     credential.disabled && credential.disabledReason === "QuotaExceeded";
@@ -475,17 +477,24 @@ export function CredentialCard({
             tone: "sky" as const,
             title: "普通 429 限流冷却中，调度会临时跳过此凭据",
           }
-        : isQuotaExceeded
+        : isCapped
           ? {
-              label: "超额中",
-              tone: "amber" as const,
-              title: "基础额度已用满",
+              label: "已封顶",
+              tone: "red" as const,
+              title:
+                "基础额度与超额均已用尽（或订阅不支持超额），无法再服务请求，刷新余额后会被自动禁用",
             }
-          : {
-              label: "正常",
-              tone: "green" as const,
-              title: "状态正常",
-            };
+          : isQuotaExceeded
+            ? {
+                label: "超额中",
+                tone: "amber" as const,
+                title: "基础额度已用满，正在使用超额计费",
+              }
+            : {
+                label: "正常",
+                tone: "green" as const,
+                title: "状态正常",
+              };
 
   return (
     <>
@@ -517,11 +526,6 @@ export function CredentialCard({
           credential.disabled && !disabledByQuota ? "opacity-60 grayscale" : ""
         }`}
       >
-        {/* 活跃凭据：顶部渐变条 */}
-        {credential.isCurrent && (
-          <div className="pointer-events-none absolute -left-px -right-px -top-px z-10 h-1 rounded-t-2xl bg-gradient-to-r from-emerald-500/80 to-green-400/80" />
-        )}
-
         <CardHeader className="p-3.5 pb-2">
           <div className="flex items-start gap-2">
             <label
@@ -538,11 +542,17 @@ export function CredentialCard({
                 onCheckedChange={onToggleSelect}
               />
             </label>
-            {/* 字母头像：按登录方式（provider）着色 */}
+            {/* 字母头像：按登录方式（provider）着色；活跃凭据右下角绿点 */}
             <div
-              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border/50 text-sm font-bold ${provider.avatarClass}`}
+              className={`relative flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border/50 text-sm font-bold ${provider.avatarClass}`}
             >
               {displayName[0].toUpperCase()}
+              {credential.isCurrent && (
+                <span
+                  className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-card"
+                  title="当前活跃凭据"
+                />
+              )}
             </div>
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1">
@@ -783,12 +793,16 @@ export function CredentialCard({
                 const overLimit = limit > 0 && used > limit;
                 const basePct =
                   limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
-                const overageAmount = overLimit ? used - limit : 0;
-                // 超额条以固定的超额总上限（OVERAGE_CAP）为参照，反映真实占比，
-                // 而非旧实现里以基础额度为分母导致的恒满。
+                // 优先用上游返回的真实超额用量/上限；缺失时回退推算值和默认上限
+                const overageAmount =
+                  balance.overageUsed ?? (overLimit ? used - limit : 0);
+                const overageCap =
+                  balance.overageCap && balance.overageCap > 0
+                    ? balance.overageCap
+                    : OVERAGE_CAP;
                 const overagePct = Math.min(
                   100,
-                  (overageAmount / OVERAGE_CAP) * 100,
+                  (overageAmount / overageCap) * 100,
                 );
                 return (
                   <div className="flex flex-1 flex-col gap-2.5">
@@ -850,13 +864,25 @@ export function CredentialCard({
                     {overLimit && (
                       <div className="space-y-1.5">
                         <div className="flex items-center justify-between text-[11px] tabular-nums">
-                          <span className="flex items-center gap-1 font-medium text-violet-600 dark:text-violet-400">
+                          <span
+                            className="flex items-center gap-1 font-medium text-violet-600 dark:text-violet-400"
+                            title={
+                              balance.overageCharges != null
+                                ? `超额计费金额：$${formatNumber(balance.overageCharges)}`
+                                : undefined
+                            }
+                          >
                             <Zap className="h-3 w-3" />
                             超额用量
+                            {balance.overageCharges != null && (
+                              <span className="font-semibold">
+                                ${formatNumber(balance.overageCharges)}
+                              </span>
+                            )}
                           </span>
                           <span className="font-medium text-violet-600 dark:text-violet-400">
                             +${formatNumber(overageAmount)} / $
-                            {formatNumber(OVERAGE_CAP)}
+                            {formatNumber(overageCap)}
                             <span className="ml-1 text-muted-foreground">
                               {overagePct.toFixed(1)}%
                             </span>
