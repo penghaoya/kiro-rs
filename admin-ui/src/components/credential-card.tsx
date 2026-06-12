@@ -69,7 +69,7 @@ interface CredentialCardProps {
   onToggleSelect: () => void;
   balance: BalanceResponse | null;
   loadingBalance: boolean;
-  onRefreshBalance: () => void;
+  onRefreshBalance: () => void | Promise<void>;
   /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
   failureStats?: { auth: number; throttle: number; other: number };
 }
@@ -303,6 +303,9 @@ export function CredentialCard({
     setOverageBusy(true);
     try {
       await setCredentialOverage(credential.id, enabled);
+      // 后端切换成功后会清掉该凭据的余额缓存；这里立即重新拉取余额，
+      // 让 ⚡ 开关反映上游确认后的真实状态（而不是旧快照弹回）。
+      await onRefreshBalance();
       toast.success(enabled ? "已开启超额" : "已关闭超额");
       queryClient.invalidateQueries({ queryKey: ["credentials"] });
     } catch (err) {

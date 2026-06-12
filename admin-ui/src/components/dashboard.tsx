@@ -123,7 +123,7 @@ import {
   formatNumber,
   mapWithConcurrency,
 } from "@/lib/utils";
-import type { BalanceResponse } from "@/types/api";
+import type { BalanceResponse, CredentialStatusItem } from "@/types/api";
 import type { RetryMode, RetryPolicy } from "@/api/credentials";
 
 interface DashboardProps {
@@ -371,9 +371,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [verifyResults, setVerifyResults] = useState<Map<number, VerifyResult>>(
     new Map(),
   );
-  const [balanceMap, setBalanceMap] = useState<Map<number, BalanceResponse>>(
-    new Map(),
-  );
+  /** 手动刷新得到的余额快照（带时间戳，与服务端缓存比新旧后取较新者） */
+  const [balanceMap, setBalanceMap] = useState<
+    Map<number, { data: BalanceResponse; fetchedAt: number }>
+  >(new Map());
   const [loadingBalanceIds, setLoadingBalanceIds] = useState<Set<number>>(
     new Set(),
   );
@@ -497,10 +498,26 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     return Boolean(c?.disabled);
   }).length;
 
+  /**
+   * 取"本地手动刷新快照"与"服务端缓存余额"中较新的一份。
+   * 旧实现本地快照永远优先，会遮蔽服务端后续更新（如切换超额后的预热结果），
+   * 导致开关状态与真实行为不一致。
+   */
+  const getEffectiveBalance = (
+    c: CredentialStatusItem,
+  ): BalanceResponse | null => {
+    const local = balanceMap.get(c.id);
+    if (local && c.balance) {
+      const serverAtMs = (c.balanceUpdatedAt ?? 0) * 1000;
+      return local.fetchedAt >= serverAtMs ? local.data : c.balance;
+    }
+    return local?.data ?? c.balance ?? null;
+  };
+
   // 已超额且尚未禁用的数量（用于一键超额按钮）
   const quotaExceededCount = (data?.credentials || []).filter((c) => {
     if (c.disabled) return false;
-    const b = balanceMap.get(c.id) || c.balance;
+    const b = getEffectiveBalance(c);
     if (!b) return false;
     return b.remaining <= 0 || b.usagePercentage >= 100;
   }).length;
@@ -514,7 +531,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     for (const c of data?.credentials || []) {
       if (c.disabled) continue;
       total += 1;
-      const b = balanceMap.get(c.id) || c.balance;
+      const b = getEffectiveBalance(c);
       if (!b) {
         // 还没拉到余额，无法判断 — 视为待定
         unknown += 1;
@@ -543,7 +560,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
     const validIds = new Set(data.credentials.map((c) => c.id));
     setBalanceMap((prev) => {
-      const next = new Map<number, BalanceResponse>();
+      const next = new Map<
+        number,
+        { data: BalanceResponse; fetchedAt: number }
+      >();
       prev.forEach((v, id) => {
         if (validIds.has(id)) next.set(id, v);
       });
@@ -743,7 +763,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         s++;
         setBalanceMap((prev) => {
           const n = new Map(prev);
-          n.set(id, balance);
+          n.set(id, { data: balance, fetchedAt: Date.now() });
           return n;
         });
       } catch {
@@ -772,7 +792,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       const balance = await getCredentialBalance(id);
       setBalanceMap((prev) => {
         const n = new Map(prev);
-        n.set(id, balance);
+        n.set(id, { data: balance, fetchedAt: Date.now() });
         return n;
       });
       toast.success("余额已刷新");
@@ -904,6 +924,23 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       else if (fail > 0)
         toast.error(`全部失败：${res.failureMessages?.[0] || ""}`);
       else toast.info("没有需要操作的凭据");
+      // 后端已确认这些凭据开启成功并清掉了服务端余额缓存；
+      // 同步修正本地快照，避免旧的 overageEnabled=false 继续展示
+      if (res.enabledIds?.length) {
+        setBalanceMap((prev) => {
+          const n = new Map(prev);
+          for (const id of res.enabledIds) {
+            const entry = n.get(id);
+            if (entry) {
+              n.set(id, {
+                data: { ...entry.data, overageEnabled: true },
+                fetchedAt: Date.now(),
+              });
+            }
+          }
+          return n;
+        });
+      }
       queryClient.invalidateQueries({ queryKey: ["credentials"] });
     } catch (err) {
       toast.error("一键开启超额失败: " + extractErrorMessage(err));
@@ -923,7 +960,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     const targets = (data?.credentials || [])
       .filter((c) => {
         if (c.disabled) return false;
-        const b = balanceMap.get(c.id) || c.balance;
+        const b = getEffectiveBalance(c);
         if (!b) return true;
         return b.overageCapable === undefined || b.overageCapable === null;
       })
@@ -948,7 +985,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         s++;
         setBalanceMap((prev) => {
           const n = new Map(prev);
-          n.set(id, balance);
+          n.set(id, { data: balance, fetchedAt: Date.now() });
           return n;
         });
       } catch {
@@ -1534,11 +1571,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       credential={credential}
                       selected={selectedIds.has(credential.id)}
                       onToggleSelect={() => toggleSelect(credential.id)}
-                      balance={
-                        balanceMap.get(credential.id) ||
-                        credential.balance ||
-                        null
-                      }
+                      balance={getEffectiveBalance(credential)}
                       loadingBalance={loadingBalanceIds.has(credential.id)}
                       onRefreshBalance={() =>
                         handleRefreshBalance(credential.id)
