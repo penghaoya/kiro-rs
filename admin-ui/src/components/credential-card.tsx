@@ -337,11 +337,25 @@ export function CredentialCard({
     }
   };
 
+  // 计算「有效禁用」状态与「手动覆写」是否仍在生效。
+  // 让 UI 的各个状态体现（灰化 / 开关 / 响应点击）全部以 effectiveDisabled 为准，避免「卡片已灰 但 Switch 仍为 ON」的不一致。
+  const nowSec = Math.floor(Date.now() / 1000);
+  const overrideActive =
+    credential.quotaOverrideUntil != null &&
+    credential.quotaOverrideUntil > nowSec;
+  // capped 在 覆写期间不计为「不可用」（用户已明示要求它继续跳调度）
+  const isCapped = balance?.capped === true && !overrideActive;
+  const effectiveDisabled = credential.disabled || isCapped;
+
   const handleToggleDisabled = () => {
-    // 当前为禁用态 → 这次操作是“启用”，启用成功后顺带刷新一次余额
-    const willEnable = credential.disabled;
+    // 以 effectiveDisabled 为准：
+    //  - effectiveDisabled=true (开关显示 OFF) → 用户意图是「启用」
+    //  - effectiveDisabled=false (开关显示 ON) → 用户意图是「禁用」
+    // 对于 capped 但未 disabled 的赛道，此调用会以 disabled=false 走后端启用路径，
+    // 后端看到 cached.capped=true 会设置 quota_override_until →下次余额刷新不会被自动打回。
+    const willEnable = effectiveDisabled;
     setDisabled.mutate(
-      { id: credential.id, disabled: !credential.disabled },
+      { id: credential.id, disabled: !willEnable },
       {
         onSuccess: (res) => {
           toast.success(res.message);
@@ -429,8 +443,6 @@ export function CredentialCard({
   const isQuotaExceeded = balance
     ? balance.remaining <= 0 || balance.usagePercentage >= 100
     : false;
-  /** 已封顶：基础额度 + 超额均用尽（或无超额能力），后端刷新余额时会自动禁用 */
-  const isCapped = balance?.capped === true;
 
   const disabledByQuota =
     credential.disabled && credential.disabledReason === "QuotaExceeded";
@@ -484,7 +496,14 @@ export function CredentialCard({
               title:
                 "基础额度与超额均已用尽（或订阅不支持超额），无法再服务请求，刷新余额后会被自动禁用",
             }
-          : isQuotaExceeded
+          : overrideActive && balance?.capped
+            ? {
+                label: "覆写中",
+                tone: "amber" as const,
+                title:
+                  "账号余额仍显示封顶，但你已手动启用；在本额度周期内不会被自动禁用",
+              }
+            : isQuotaExceeded
             ? {
                 label: "超额中",
                 tone: "amber" as const,
@@ -522,8 +541,8 @@ export function CredentialCard({
                       ? "ring-1 ring-amber-500/60"
                       : ""
         } ${
-          // 禁用或已封顶的账号统一灰化去色：一眼即知不可用
-          credential.disabled || isCapped ? "opacity-60 grayscale" : ""
+          // 禁用或已封顶（且未手动覆写）的账号统一灰化去色：一眼即知不可用
+          effectiveDisabled ? "opacity-60 grayscale" : ""
         }`}
       >
         <CardHeader className="p-3.5 pb-2">
@@ -622,10 +641,18 @@ export function CredentialCard({
               )}
               <Switch
                 size="sm"
-                checked={!credential.disabled}
+                checked={!effectiveDisabled}
                 onCheckedChange={handleToggleDisabled}
                 disabled={setDisabled.isPending}
-                title={credential.disabled ? "启用凭据" : "禁用凭据"}
+                title={
+                  effectiveDisabled
+                    ? credential.disabled
+                      ? "启用凭据"
+                      : "账号已封顶，点击手动启用（本周期内不会被自动禁用）"
+                    : overrideActive
+                      ? "手动覆写中，点击禁用"
+                      : "禁用凭据"
+                }
               />
               <StatusPill {...statusPill} />
             </div>

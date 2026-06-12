@@ -724,6 +724,12 @@ struct CredentialEntry {
     /// 与账号级 suspicious activity 冷却不同：普通 429 不增加连续失败、不禁用凭据，
     /// 仅在本进程内短暂跳过该凭据，让请求可切换到其它可用凭据。
     rate_limited_until: Option<Instant>,
+    /// 用户手动启用 capped 账号后的「封顶自动禁用」覆写到期时间（Unix 秒）
+    ///
+    /// `Some(t)` 且 `now < t` 时，`get_balance_opts` 检测到 capped 也不会自动禁用此凭据。
+    /// 与 `KiroCredentials.quota_override_until` 双向同步以持久化到凭据文件。
+    /// 手动禁用 / 到期后自然失效。
+    quota_override_until: Option<i64>,
 }
 
 /// 禁用原因
@@ -832,6 +838,10 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 用户手动启用 capped 账号后的封顶自动禁用覆写到期时间（Unix 秒）。
+    /// 仅在覆写仍然有效（`now < t`）时返回，已过期则置 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_override_until: Option<i64>,
 }
 
 /// 凭据管理器状态快照
@@ -963,6 +973,7 @@ impl MultiTokenManager {
                     last_used_at: None,
                     throttled_until: None,
                     rate_limited_until: None,
+                    quota_override_until: cred.quota_override_until,
                 }
             })
             .collect();
@@ -1536,8 +1547,9 @@ impl MultiTokenManager {
                 .map(|e| {
                     let mut cred = e.credentials.clone();
                     cred.canonicalize_auth_method();
-                    // 同步 disabled 状态到凭据对象
+                    // 同步 disabled / quota_override_until 状态到凭据对象
                     cred.disabled = e.disabled;
+                    cred.quota_override_until = e.quota_override_until;
                     cred
                 })
                 .collect()
@@ -2154,6 +2166,9 @@ impl MultiTokenManager {
                     rate_limited_for_ms: cooldown_remaining_ms(e.rate_limited_until),
                     rate_limited_until_ms: cooldown_remaining_ms(e.rate_limited_until),
                     endpoint: e.credentials.endpoint.clone(),
+                    quota_override_until: e
+                        .quota_override_until
+                        .filter(|t| *t > Utc::now().timestamp()),
                 })
                 .collect(),
             current_id,
@@ -2163,6 +2178,10 @@ impl MultiTokenManager {
     }
 
     /// 设置凭据禁用状态（Admin API）
+    ///
+    /// 启用时重置失败计数、清空 disabled_reason / 临时冷却；保留 `quota_override_until`
+    /// 由 AdminService 包装层根据上下文决定是否写入（封顶覆写仅在确认是从 capped 启用过来时设置）。
+    /// 手动禁用时清空 `quota_override_until`，让账号恢复默认的封顶自动保护。
     pub fn set_disabled(&self, id: u64, disabled: bool) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -2180,11 +2199,59 @@ impl MultiTokenManager {
                 entry.rate_limited_until = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
+                // 手动禁用 → 清除封顶覆写，恢复默认的封顶自动禁用保护
+                entry.quota_override_until = None;
             }
         }
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 设置封顶自动禁用覆写到期时间（Admin API）。
+    ///
+    /// `Some(t)` 表示在 Unix 时间 `t` 之前余额查询检测到 capped 也不会自动禁用此凭据；
+    /// `None` 表示清除覆写、恢复默认保护。
+    pub fn set_quota_override(&self, id: u64, until: Option<i64>) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            entry.quota_override_until = until;
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 读取凭据当前的封顶覆写到期时间（Unix 秒），未设置或不存在时返回 None。
+    pub fn get_quota_override_until(&self, id: u64) -> Option<i64> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.quota_override_until)
+    }
+
+    /// 读取凭据当前的禁用原因（字符串形式，与快照 API 一致）。
+    pub fn get_disabled_reason_str(&self, id: u64) -> Option<String> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.disabled_reason)
+            .map(|r| {
+                match r {
+                    DisabledReason::Manual => "Manual",
+                    DisabledReason::TooManyFailures => "TooManyFailures",
+                    DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
+                    DisabledReason::QuotaExceeded => "QuotaExceeded",
+                    DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
+                    DisabledReason::InvalidConfig => "InvalidConfig",
+                }
+                .to_string()
+            })
     }
 
     /// 标记凭据进入临时冷却期（账号级 429 风控触发）
@@ -2853,6 +2920,7 @@ impl MultiTokenManager {
                 last_used_at: None,
                 throttled_until: None,
                 rate_limited_until: None,
+                quota_override_until: None,
             });
         }
 

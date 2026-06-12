@@ -510,6 +510,7 @@ impl AdminService {
                     balance_updated_at,
                     rate_limited_for_ms: entry.rate_limited_for_ms,
                     rate_limited_until_ms: entry.rate_limited_until_ms,
+                    quota_override_until: entry.quota_override_until,
                 }
             })
             .collect();
@@ -567,6 +568,7 @@ impl AdminService {
         let mut skipped_ids: Vec<u64> = Vec::new();
         let mut switched_current = false;
 
+        let now_secs = Utc::now().timestamp();
         for entry in snapshot.entries.iter() {
             if entry.disabled {
                 continue;
@@ -577,6 +579,16 @@ impl AdminService {
             };
             let exceeded = cached.data.remaining <= 0.0 || cached.data.usage_percentage >= 100.0;
             if !exceeded {
+                continue;
+            }
+            // 用户已显式覆写（手动启用 capped 账号）→ 一键操作也尊重该选择
+            let overridden = self
+                .token_manager
+                .get_quota_override_until(entry.id)
+                .map(|t| now_secs < t)
+                .unwrap_or(false);
+            if overridden {
+                skipped_ids.push(entry.id);
                 continue;
             }
             match self.token_manager.disable_quota_exceeded(entry.id) {
@@ -604,14 +616,49 @@ impl AdminService {
     }
 
     /// 设置凭据禁用状态
+    ///
+    /// 启用路径额外逻辑：若该凭据之前是 `QuotaExceeded` 被自动禁用，或者缓存余额仍显示 `capped:true`，
+    /// 则为其设置「封顶自动禁用覆写」到本周期额度重置时点，防止下次余额刷新会立刻把账号打回原形。
     pub fn set_disabled(&self, id: u64, disabled: bool) -> Result<(), AdminServiceError> {
         // 先获取当前凭据 ID，用于判断是否需要切换
         let snapshot = self.token_manager.snapshot();
         let current_id = snapshot.current_id;
+        // 在调用 set_disabled 之前记下原始禁用原因，以便判断是否需要设置覆写
+        let prior_reason = self.token_manager.get_disabled_reason_str(id);
 
         self.token_manager
             .set_disabled(id, disabled)
             .map_err(|e| self.classify_error(e, id))?;
+
+        if !disabled {
+            // 手动启用：设置封顶覆写（如果是从 capped 启用过来的）
+            let cached = {
+                let cache = self.balance_cache.lock();
+                cache.get(&id).cloned()
+            };
+            let cached_capped = cached.as_ref().map(|c| c.data.capped).unwrap_or(false);
+            let was_quota_disabled = prior_reason.as_deref() == Some("QuotaExceeded");
+            if was_quota_disabled || cached_capped {
+                // 优先用下一次额度重置时间（额度自然重置后恢复默认保护）；
+                // 拿不到时兑底 24 小时，避免覆写永久生效
+                let until = cached
+                    .as_ref()
+                    .and_then(|c| c.data.next_reset_at)
+                    .map(|t| t as i64)
+                    .unwrap_or_else(|| Utc::now().timestamp() + 24 * 3600);
+                if let Err(e) = self.token_manager.set_quota_override(id, Some(until)) {
+                    tracing::warn!("凭据 #{} 设置封顶覆写失败: {}", id, e);
+                } else {
+                    tracing::info!(
+                        "凭据 #{} 手动启用，已设置封顶自动禁用覆写至 ts={}（prior_reason={:?}, cached_capped={}）",
+                        id,
+                        until,
+                        prior_reason,
+                        cached_capped,
+                    );
+                }
+            }
+        }
 
         // 只有禁用的是当前凭据时才尝试切换到下一个
         if disabled && id == current_id {
@@ -689,6 +736,7 @@ impl AdminService {
 
         // 封顶（基础额度 + 超额均用尽，或掉订阅无法超额）的账号已无法服务请求：
         // 自动以 QuotaExceeded 禁用，避免继续参与调度白白吃失败。
+        // 例外：用户手动启用后设置了 quota_override_until，该覆写有效期内尊重用户选择。
         if balance.capped {
             let snapshot = self.token_manager.snapshot();
             let already_disabled = snapshot
@@ -697,7 +745,18 @@ impl AdminService {
                 .find(|e| e.id == id)
                 .map(|e| e.disabled)
                 .unwrap_or(true);
-            if !already_disabled {
+            let now_ts = Utc::now().timestamp();
+            let overridden = self
+                .token_manager
+                .get_quota_override_until(id)
+                .map(|t| now_ts < t)
+                .unwrap_or(false);
+            if overridden {
+                tracing::debug!(
+                    "凭据 #{} 余额仍显示封顶，但用户覆写未到期，跳过自动禁用",
+                    id
+                );
+            } else if !already_disabled {
                 let was_current = snapshot.current_id == id;
                 match self.token_manager.disable_quota_exceeded(id) {
                     Ok(()) => {
@@ -1077,6 +1136,7 @@ impl AdminService {
             proxy_username: req.proxy_username,
             proxy_password: req.proxy_password,
             disabled: false, // 新添加的凭据默认启用
+            quota_override_until: None,
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
         };

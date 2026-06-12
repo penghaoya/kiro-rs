@@ -43,6 +43,9 @@ export interface CredentialStatusItem {
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
   balanceUpdatedAt?: number
+  /** 用户手动启用 capped 账号后的「封顶自动禁用覆写」到期时间（Unix 秒）。
+   *  仅当覆写仍然有效时返回；到期前 capped 余额不会触发自动禁用。 */
+  quotaOverrideUntil?: number
 }
 
 // 余额响应

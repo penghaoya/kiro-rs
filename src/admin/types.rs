@@ -86,6 +86,9 @@ pub struct CredentialStatusItem {
     /// 普通 429 限流冷却剩余毫秒兼容字段
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limited_until_ms: Option<u64>,
+    /// 用户手动启用 capped 账号后的封顶自动禁用覆写到期时间（Unix 秒）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_override_until: Option<i64>,
 }
 
 /// 当前运行兼容配置

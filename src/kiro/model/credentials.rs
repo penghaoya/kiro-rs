@@ -136,6 +136,16 @@ pub struct KiroCredentials {
     #[serde(default)]
     pub disabled: bool,
 
+    /// 用户手动启用 capped 账号后的「封顶自动禁用」覆写到期时间（Unix 秒）
+    ///
+    /// 当 balance.capped=true 时，AdminService 默认会把账号自动以 QuotaExceeded 禁用。
+    /// 用户手动重新启用后写入此字段（通常取下一次额度重置时间），
+    /// 在到期前余额查询将跳过自动禁用，让用户的「强行启用」生效到本周期结束。
+    /// 手动禁用时会被清空。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub quota_override_until: Option<i64>,
+
     /// Kiro API Key（headless 模式）
     /// 格式: ksk_xxxxxxxx
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
@@ -189,6 +199,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("proxy_username", &self.proxy_username)
             .field("proxy_password", &fmt_redacted(&self.proxy_password))
             .field("disabled", &self.disabled)
+            .field("quota_override_until", &self.quota_override_until)
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
             .finish()
@@ -554,6 +565,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            quota_override_until: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -823,6 +835,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            quota_override_until: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -856,6 +869,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            quota_override_until: None,
             kiro_api_key: None,
             endpoint: None,
         };
@@ -972,6 +986,7 @@ mod tests {
             proxy_username: None,
             proxy_password: None,
             disabled: false,
+            quota_override_until: None,
             kiro_api_key: None,
             endpoint: None,
         };
