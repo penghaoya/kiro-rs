@@ -784,7 +784,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         return n;
       });
       try {
-        const balance = await getCredentialBalance(id);
+        const balance = await getCredentialBalance(id, true);
         s++;
         setBalanceMap((prev) => {
           const n = new Map(prev);
@@ -814,7 +814,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return n;
     });
     try {
-      const balance = await getCredentialBalance(id);
+      const balance = await getCredentialBalance(id, true);
       setBalanceMap((prev) => {
         const n = new Map(prev);
         n.set(id, { data: balance, fetchedAt: Date.now() });
@@ -858,7 +858,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         return n;
       });
       try {
-        const balance = await getCredentialBalance(id);
+        const balance = await getCredentialBalance(id, true);
         successCount++;
         setVerifyResults((prev) => {
           const n = new Map(prev);
@@ -1006,7 +1006,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         return n;
       });
       try {
-        const balance = await getCredentialBalance(id);
+        const balance = await getCredentialBalance(id, true);
         s++;
         setBalanceMap((prev) => {
           const n = new Map(prev);
@@ -1612,6 +1612,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       selected={selectedIds.has(credential.id)}
                       onToggleSelect={() => toggleSelect(credential.id)}
                       balance={getEffectiveBalance(credential)}
+                      balanceFetchedAt={
+                        balanceMap.get(credential.id)?.fetchedAt ??
+                        (credential.balanceUpdatedAt
+                          ? credential.balanceUpdatedAt * 1000
+                          : null)
+                      }
                       privacyMode={privacyMode}
                       loadingBalance={loadingBalanceIds.has(credential.id)}
                       onRefreshBalance={() =>

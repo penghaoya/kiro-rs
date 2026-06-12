@@ -268,7 +268,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
             await new Promise(resolve => setTimeout(resolve, 1000))
 
             // 验活
-            const balance = await getCredentialBalance(addedCred.credentialId)
+            const balance = await getCredentialBalance(addedCred.credentialId, true)
 
             successCount++
             existingApiKeyHashes.add(credHash)
@@ -323,7 +323,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           await new Promise(resolve => setTimeout(resolve, 1000))
 
           // 验活
-          const balance = await getCredentialBalance(addedCred.credentialId)
+          const balance = await getCredentialBalance(addedCred.credentialId, true)
 
           // 验活成功
           const oauthDisplayEmail = addedCredEmail

@@ -647,8 +647,19 @@ impl AdminService {
 
     /// 获取凭据余额（带缓存）
     pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
-        {
+        self.get_balance_opts(id, false).await
+    }
+
+    /// 获取余额。`force = true` 时跳过缓存读取，强制从上游拉取
+    /// （用户主动点击"刷新余额"/验活时必须拿到真实状态，封禁、掉订阅
+    /// 等异常不能被 5 分钟缓存掩盖成"刷新成功"）。
+    pub async fn get_balance_opts(
+        &self,
+        id: u64,
+        force: bool,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        // 先查缓存（force 时跳过）
+        if !force {
             let cache = self.balance_cache.lock();
             if let Some(cached) = cache.get(&id) {
                 let now = Utc::now().timestamp() as f64;

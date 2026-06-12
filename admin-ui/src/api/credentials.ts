@@ -159,9 +159,12 @@ export async function clearThrottle(id: number): Promise<SuccessResponse> {
   return data
 }
 
-// 获取凭据余额
-export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
-  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+// 获取凭据余额。force=true 绕过后端 5 分钟缓存强制打上游，
+// 用于用户主动刷新/验活——否则缓存命中会把封禁、掉订阅等异常掩盖成"刷新成功"。
+export async function getCredentialBalance(id: number, force = false): Promise<BalanceResponse> {
+  const { data } = await api.get<BalanceResponse>(
+    `/credentials/${id}/balance${force ? '?force=true' : ''}`,
+  )
   return data
 }
 

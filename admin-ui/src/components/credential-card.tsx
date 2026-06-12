@@ -68,6 +68,8 @@ interface CredentialCardProps {
   selected: boolean;
   onToggleSelect: () => void;
   balance: BalanceResponse | null;
+  /** 余额数据的获取时间（毫秒时间戳），用于展示数据新鲜度 */
+  balanceFetchedAt?: number | null;
   /** 隐私模式：邮箱脱敏展示（复制仍为明文） */
   privacyMode?: boolean;
   loadingBalance: boolean;
@@ -208,6 +210,7 @@ export function CredentialCard({
   selected,
   onToggleSelect,
   balance,
+  balanceFetchedAt,
   privacyMode = false,
   loadingBalance,
   onRefreshBalance,
@@ -851,14 +854,18 @@ export function CredentialCard({
                       </div>
                     )}
 
-                    {/* 重置 */}
+                    {/* 重置 + 数据新鲜度 */}
                     <div className="mt-auto flex items-center justify-between border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
-                      <span>额度重置</span>
+                      <span title="余额数据的最近获取时间">
+                        {balanceFetchedAt
+                          ? `更新于 ${formatLastUsed(new Date(balanceFetchedAt).toISOString())}`
+                          : "\u00A0"}
+                      </span>
                       <span
                         className="font-medium text-foreground"
-                        title={formatResetDate(balance.nextResetAt)}
+                        title={`额度重置：${formatResetDate(balance.nextResetAt)}`}
                       >
-                        {formatResetShort(balance.nextResetAt)}
+                        重置 {formatResetShort(balance.nextResetAt)}
                       </span>
                     </div>
                   </div>

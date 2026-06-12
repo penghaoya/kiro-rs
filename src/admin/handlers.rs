@@ -144,11 +144,20 @@ pub async fn clear_throttle(
 pub async fn get_credential_balance(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Query(query): Query<BalanceQuery>,
 ) -> impl IntoResponse {
-    match state.service.get_balance(id).await {
+    let force = query.force.unwrap_or(false);
+    match state.service.get_balance_opts(id, force).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// `GET /credentials/:id/balance` 的查询参数
+#[derive(serde::Deserialize)]
+pub struct BalanceQuery {
+    /// true 时绕过 5 分钟余额缓存，强制打上游（用户主动刷新/验活场景）
+    pub force: Option<bool>,
 }
 
 /// GET /api/admin/credentials/:id/models

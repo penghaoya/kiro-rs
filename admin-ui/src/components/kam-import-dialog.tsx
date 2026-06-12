@@ -405,7 +405,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
           await new Promise(resolve => setTimeout(resolve, 1000))
 
-          const balance = await getCredentialBalance(addedCred.credentialId)
+          const balance = await getCredentialBalance(addedCred.credentialId, true)
 
           successCount++
           existingTokenHashes.add(tokenHash)
