@@ -14,6 +14,7 @@ import {
   Clock,
   ScrollText,
   Boxes,
+  Server,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -141,10 +142,10 @@ function OverageStatusPill({ balance }: { balance: BalanceResponse }) {
     return (
       <span
         className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 h-6 text-[11px] font-medium text-emerald-700 dark:text-emerald-400"
-        title="此账号已开启超额"
+        title="此账号已开启超额计费"
       >
         <Zap className="h-3 w-3" />
-        超额
+        超额计费
       </span>
     );
   }
@@ -156,7 +157,7 @@ function OverageStatusPill({ balance }: { balance: BalanceResponse }) {
         title="此账号支持超额但当前未开启"
       >
         <ZapOff className="h-3 w-3" />
-        未开
+        未开超额
       </span>
     );
   }
@@ -479,15 +480,15 @@ export function CredentialCard({
                 {credential.isCurrent && <Badge variant="success">活跃</Badge>}
                 <Badge
                   variant="outline"
+                  className="gap-1 font-normal"
                   title={
                     credential.configuredEndpoint
                       ? `显式 endpoint: ${credential.configuredEndpoint}；生效 endpoint: ${credential.effectiveEndpoint}`
                       : `跟随默认 endpoint；生效 endpoint: ${credential.effectiveEndpoint}`
                   }
                 >
-                  {credential.configuredEndpoint
-                    ? `Endpoint ${credential.configuredEndpoint}`
-                    : `Endpoint 默认(${credential.effectiveEndpoint})`}
+                  <Server className="h-3 w-3 opacity-70" />
+                  {credential.configuredEndpoint || credential.effectiveEndpoint}
                 </Badge>
                 {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
                 {credential.disabled && reasonStyle && (
@@ -500,7 +501,7 @@ export function CredentialCard({
                 )}
                 {/* 仍启用但已经达到上限：黄色"已超额"徽章 */}
                 {!credential.disabled && isQuotaExceeded && (
-                  <Badge variant="warning">已超额</Badge>
+                  <Badge variant="warning">超出额度</Badge>
                 )}
                 {isThrottled && (
                   <Badge
@@ -546,137 +547,138 @@ export function CredentialCard({
         </CardHeader>
 
         <CardContent className="flex flex-1 flex-col space-y-3 p-4 pt-0">
-          {/* 信息行 */}
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[13px]">
-            <div className="flex items-center justify-between gap-2">
-              <dt className="text-muted-foreground">优先级</dt>
-              <dd>
-                {editingPriority ? (
-                  <div className="inline-flex items-center gap-1">
-                    <Input
-                      type="number"
-                      value={priorityValue}
-                      onChange={(e) => setPriorityValue(e.target.value)}
-                      className="w-16 h-7 text-sm rounded-md"
-                      min="0"
-                    />
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="h-7 w-7"
-                      onClick={handlePriorityChange}
-                      disabled={setPriority.isPending}
-                    >
-                      ✓
-                    </Button>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="h-7 w-7"
-                      onClick={() => {
-                        setEditingPriority(false);
-                        setPriorityValue(String(credential.priority));
-                      }}
-                    >
-                      ✕
-                    </Button>
-                  </div>
-                ) : (
-                  <button
-                    type="button"
-                    className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
-                    onClick={() => setEditingPriority(true)}
-                    title="点击编辑优先级"
+          {/* 信息行：紧凑指标条 — 优先级 / 失败 / 刷新失败 / 成功，最后调用单列右对齐 */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[13px]">
+            <div className="flex items-center gap-1.5">
+              <span className="text-muted-foreground">优先级</span>
+              {editingPriority ? (
+                <span className="inline-flex items-center gap-1">
+                  <Input
+                    type="number"
+                    value={priorityValue}
+                    onChange={(e) => setPriorityValue(e.target.value)}
+                    className="w-14 h-7 text-sm rounded-md"
+                    min="0"
+                  />
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7"
+                    onClick={handlePriorityChange}
+                    disabled={setPriority.isPending}
                   >
-                    {credential.priority}
-                    <Pencil className="h-3 w-3 opacity-70" />
-                  </button>
-                )}
-              </dd>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <dt className="text-muted-foreground">失败次数</dt>
-              <dd>
+                    ✓
+                  </Button>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7"
+                    onClick={() => {
+                      setEditingPriority(false);
+                      setPriorityValue(String(credential.priority));
+                    }}
+                  >
+                    ✕
+                  </Button>
+                </span>
+              ) : (
                 <button
                   type="button"
-                  onClick={() => setShowFailuresDialog(true)}
-                  className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent"
-                  title="鉴权失败 / 账号风控 / 其他（额度·瞬态·网络等）。点击查看失败日志详情"
+                  className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
+                  onClick={() => setEditingPriority(true)}
+                  title="点击编辑优先级"
                 >
-                  {failureStats ? (
-                    <span className="tabular-nums">
-                      <span className="text-destructive">{failureStats.auth}</span>
-                      <span className="text-muted-foreground/50">/</span>
-                      <span className="text-amber-600 dark:text-amber-400">
-                        {failureStats.throttle}
-                      </span>
-                      <span className="text-muted-foreground/50">/</span>
-                      <span className="text-muted-foreground">{failureStats.other}</span>
-                    </span>
-                  ) : (
-                    <span
-                      className={
-                        credential.totalFailureCount > 0
-                          ? "text-destructive"
-                          : "text-muted-foreground"
-                      }
-                    >
-                      {credential.totalFailureCount}
-                    </span>
-                  )}
-                  <ScrollText className="h-3.5 w-3.5 opacity-70" />
+                  {credential.priority}
+                  <Pencil className="h-3 w-3 opacity-70" />
                 </button>
-              </dd>
+              )}
             </div>
-            <div className="flex items-center justify-between gap-2">
-              <dt className="text-muted-foreground">刷新失败</dt>
-              <dd
-                className={`tabular-nums font-medium ${credential.refreshFailureCount > 0 ? "text-destructive" : ""}`}
+
+            <div className="flex items-center gap-1.5">
+              <span className="text-muted-foreground">失败</span>
+              <button
+                type="button"
+                onClick={() => setShowFailuresDialog(true)}
+                className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent"
+                title="鉴权失败 / 账号风控 / 其他（额度·瞬态·网络等）。点击查看失败日志详情"
+              >
+                {failureStats ? (
+                  <span className="tabular-nums">
+                    <span className="text-destructive">{failureStats.auth}</span>
+                    <span className="text-muted-foreground/50">/</span>
+                    <span className="text-amber-600 dark:text-amber-400">
+                      {failureStats.throttle}
+                    </span>
+                    <span className="text-muted-foreground/50">/</span>
+                    <span className="text-muted-foreground">
+                      {failureStats.other}
+                    </span>
+                  </span>
+                ) : (
+                  <span
+                    className={
+                      credential.totalFailureCount > 0
+                        ? "text-destructive"
+                        : "text-muted-foreground"
+                    }
+                  >
+                    {credential.totalFailureCount}
+                  </span>
+                )}
+                <ScrollText className="h-3.5 w-3.5 opacity-70" />
+              </button>
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              <span className="text-muted-foreground">刷新失败</span>
+              <span
+                className={`px-1.5 tabular-nums font-medium ${credential.refreshFailureCount > 0 ? "text-destructive" : ""}`}
               >
                 {credential.refreshFailureCount}
-              </dd>
+              </span>
             </div>
-            <div className="flex items-center justify-between gap-2">
-              <dt className="text-muted-foreground">成功次数</dt>
-              <dd>
-                <button
-                  type="button"
-                  onClick={handleResetSuccess}
-                  className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
-                  title="点击重置成功次数"
-                >
-                  {credential.successCount}
-                  <RotateCcw className="h-3 w-3 opacity-70" />
-                </button>
-              </dd>
+
+            <div className="flex items-center gap-1.5">
+              <span className="text-muted-foreground">成功</span>
+              <button
+                type="button"
+                onClick={handleResetSuccess}
+                className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
+                title="点击重置成功次数"
+              >
+                {credential.successCount}
+                <RotateCcw className="h-3 w-3 opacity-70" />
+              </button>
             </div>
-            <div className="col-span-2 flex items-center justify-between gap-2 border-t border-border/50 pt-2">
-              <dt className="text-muted-foreground">最后调用</dt>
-              <dd className="font-medium">
+
+            <div className="ml-auto flex items-center gap-1.5">
+              <span className="text-muted-foreground">最后调用</span>
+              <span className="font-medium">
                 {formatLastUsed(credential.lastUsedAt)}
-              </dd>
+              </span>
             </div>
+
             {credential.maskedApiKey && (
-              <div className="col-span-2 flex items-center justify-between gap-2">
-                <dt className="text-muted-foreground">API Key</dt>
-                <dd className="font-mono text-xs truncate">
+              <div className="flex w-full items-center justify-between gap-2 border-t border-border/50 pt-1.5">
+                <span className="text-muted-foreground">API Key</span>
+                <span className="font-mono text-xs truncate">
                   {credential.maskedApiKey}
-                </dd>
+                </span>
               </div>
             )}
             {credential.hasProxy && (
-              <div className="col-span-2 flex items-center justify-between gap-2">
-                <dt className="text-muted-foreground">代理</dt>
-                <dd className="font-mono text-xs truncate">
+              <div className="flex w-full items-center justify-between gap-2">
+                <span className="text-muted-foreground">代理</span>
+                <span className="font-mono text-xs truncate">
                   {maskProxyUrl(credential.proxyUrl ?? "")}
-                </dd>
+                </span>
               </div>
             )}
-          </dl>
+          </div>
 
           {/* 余额面板 */}
           <div
-            className={`flex min-h-[140px] flex-col rounded-xl border p-3.5 transition-colors ${
+            className={`flex min-h-[120px] flex-col rounded-xl border p-3 transition-colors ${
               isQuotaExceeded || disabledByQuota
                 ? "border-amber-500/40 bg-amber-50/60 dark:bg-amber-500/[0.06]"
                 : "border-border/60 bg-secondary/40"
@@ -702,15 +704,15 @@ export function CredentialCard({
                   (overageAmount / OVERAGE_CAP) * 100,
                 );
                 return (
-                  <div className="space-y-2.5">
-                    {/* 主行：剩余 / 超额金额 + 超额能力 */}
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
-                          {balance.remaining < 0 ? "已超额" : "剩余额度"}
-                        </div>
-                        <div
-                          className={`mt-0.5 text-xl font-semibold tabular-nums ${
+                  <div className="space-y-2">
+                    {/* 主行：剩余 / 超额金额（与标签同基线）+ 超额能力 */}
+                    <div className="flex items-baseline justify-between gap-3">
+                      <div className="flex items-baseline gap-2 min-w-0">
+                        <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
+                          {balance.remaining < 0 ? "已超额" : "剩余"}
+                        </span>
+                        <span
+                          className={`text-2xl font-semibold tabular-nums leading-none ${
                             balance.remaining < 0
                               ? "text-violet-600 dark:text-violet-400"
                               : balance.remaining === 0
@@ -721,7 +723,7 @@ export function CredentialCard({
                           {balance.remaining < 0
                             ? `-$${formatNumber(Math.abs(balance.remaining))}`
                             : `$${formatNumber(balance.remaining)}`}
-                        </div>
+                        </span>
                       </div>
                       <OverageStatusPill balance={balance} />
                     </div>

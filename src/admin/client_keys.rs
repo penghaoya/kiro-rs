@@ -30,8 +30,8 @@ const HASH_SECRET_ENV: &str = "KIRO_RS_CLIENT_KEY_HASH_SECRET";
 #[serde(rename_all = "camelCase")]
 pub struct ClientKey {
     pub id: u64,
-    /// 明文 Key。仅创建响应中返回一次；持久化时跳过。
-    #[serde(default, skip_serializing)]
+    /// 明文 Key。出于"列表二次复制"需求，现持久化保存。
+    #[serde(default)]
     pub key: String,
     /// Key 的 SHA-256 哈希（hex）。旧明文文件加载时自动迁移。
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -119,8 +119,11 @@ impl ClientKeyManager {
         for mut ck in entries {
             max_id = max_id.max(ck.id);
             if !ck.key.is_empty() {
-                ck.key_hash = hash_key_with_secret(&hash_secret, &ck.key);
-                needs_rewrite = true;
+                let new_hash = hash_key_with_secret(&hash_secret, &ck.key);
+                if ck.key_hash != new_hash {
+                    ck.key_hash = new_hash;
+                    needs_rewrite = true;
+                }
             } else if is_legacy_sha256_hash(&ck.key_hash) {
                 tracing::warn!(
                     key_id = ck.id,
@@ -131,10 +134,6 @@ impl ClientKeyManager {
                 ck.key_prefix = key_prefix(&ck.key);
                 needs_rewrite = true;
             }
-            if !ck.key.is_empty() {
-                needs_rewrite = true;
-            }
-            ck.key.clear();
             if !ck.key_hash.is_empty() {
                 by_hash.insert(ck.key_hash.clone(), ck.id);
             }
@@ -547,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn client_keys_file_does_not_contain_plaintext_key() {
+    fn client_keys_file_persists_plaintext_key() {
         let path = std::env::temp_dir().join(format!(
             "kiro-client-keys-{}.json",
             crate::security::secure_token_urlsafe(8)
@@ -556,20 +555,22 @@ mod tests {
         let entry = mgr.create("test".to_string(), None);
         let persisted = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !persisted.contains(&entry.key),
-            "client key persistence must not contain the plaintext key"
+            persisted.contains(&entry.key),
+            "client key persistence now retains the plaintext key for re-copy"
         );
         assert!(persisted.contains("keyHash"));
         assert!(persisted.contains(KEY_HASH_SCHEME));
         assert!(hash_secret_path(&path).exists());
         let loaded = ClientKeyManager::load(&path).unwrap();
+        // 重新加载后明文仍可读取，列表项可携带完整 Key
+        assert!(loaded.list().iter().any(|k| k.key == entry.key));
         assert_eq!(loaded.verify_and_touch(&entry.key), Some(entry.id));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(hash_secret_path(&path));
     }
 
     #[test]
-    fn legacy_plaintext_client_key_is_scrubbed_on_load() {
+    fn legacy_plaintext_client_key_is_retained_on_load() {
         let path = std::env::temp_dir().join(format!(
             "kiro-client-keys-legacy-{}.json",
             crate::security::secure_token_urlsafe(8)
@@ -590,8 +591,7 @@ mod tests {
         let loaded = ClientKeyManager::load(&path).unwrap();
         assert_eq!(loaded.verify_and_touch(plaintext), Some(1));
         let persisted = std::fs::read_to_string(&path).unwrap();
-        assert!(!persisted.contains(plaintext));
-        assert!(!persisted.contains(r#""key""#));
+        assert!(persisted.contains(plaintext));
         assert!(persisted.contains(KEY_HASH_SCHEME));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(hash_secret_path(&path));

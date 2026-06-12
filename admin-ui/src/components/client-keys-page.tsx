@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil,
+  Plus, KeyRound, Trash2, Copy, Check, Eye, EyeOff, Power, RotateCcw, Pencil,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -48,6 +48,7 @@ export function ClientKeysPage() {
   const [createDesc, setCreateDesc] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
+  const [createdCopied, setCreatedCopied] = useState(false)
 
   const [editOpen, setEditOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<ClientKeyItem | null>(null)
@@ -68,6 +69,7 @@ export function ClientKeysPage() {
       setCreateName('')
       setCreateDesc('')
       setShowCreatedPlain(true)
+      setCreatedCopied(false)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
     }
@@ -138,9 +140,21 @@ export function ClientKeysPage() {
   const copyText = async (text: string) => {
     try {
       await navigator.clipboard.writeText(text)
-      toast.success('已复制')
+      toast.success('已复制完整 Key')
     } catch {
       toast.error('复制失败')
+    }
+  }
+
+  const copyCreatedKey = async () => {
+    if (!createdKey) return
+    try {
+      await navigator.clipboard.writeText(createdKey.key)
+      setCreatedCopied(true)
+      toast.success('Key 已复制到剪贴板')
+      setTimeout(() => setCreatedCopied(false), 2000)
+    } catch {
+      toast.error('复制失败，请手动选择并复制')
     }
   }
 
@@ -201,7 +215,20 @@ export function ClientKeysPage() {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      <code className="text-[12px] font-mono text-muted-foreground">{k.maskedKey}</code>
+                      <div className="flex items-center gap-1.5">
+                        <code className="text-[12px] font-mono text-muted-foreground">{k.maskedKey}</code>
+                        {k.key && (
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="h-6 w-6 shrink-0"
+                            onClick={() => copyText(k.key!)}
+                            title="复制完整 Key"
+                          >
+                            <Copy className="h-3 w-3" />
+                          </Button>
+                        )}
+                      </div>
                     </td>
                     <td className="px-4 py-3">
                       {k.disabled ? (
@@ -323,7 +350,8 @@ export function ClientKeysPage() {
                 readOnly
                 type={showCreatedPlain ? 'text' : 'password'}
                 value={createdKey?.key ?? ''}
-                className="pr-20 font-mono text-[13px]"
+                onFocus={(e) => e.currentTarget.select()}
+                className="pr-10 font-mono text-[13px]"
               />
               <div className="absolute inset-y-0 right-0 flex items-center pr-1">
                 <Button
@@ -336,24 +364,26 @@ export function ClientKeysPage() {
                 >
                   {showCreatedPlain ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
                 </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="h-7 w-7"
-                  onClick={() => createdKey && copyText(createdKey.key)}
-                  title="复制"
-                >
-                  <Copy className="h-3.5 w-3.5" />
-                </Button>
               </div>
             </div>
+            <Button
+              type="button"
+              className="w-full"
+              variant={createdCopied ? 'outline' : 'default'}
+              onClick={copyCreatedKey}
+            >
+              {createdCopied ? (
+                <><Check className="h-4 w-4 text-emerald-500" />已复制到剪贴板</>
+              ) : (
+                <><Copy className="h-4 w-4" />复制 Key</>
+              )}
+            </Button>
             <p className="text-[11px] text-muted-foreground">
               客户端调用 <code>/v1/messages</code> 时，把它放在 <code>x-api-key</code> 或 <code>Authorization: Bearer</code> 头中。
             </p>
           </div>
           <DialogFooter>
-            <Button onClick={() => setCreatedKey(null)}>我已保存好</Button>
+            <Button variant="outline" onClick={() => setCreatedKey(null)}>我已保存好</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

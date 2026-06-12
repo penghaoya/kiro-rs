@@ -729,6 +729,9 @@ pub struct ClientKeyItem {
     pub id: u64,
     /// 脱敏后的 Key 展示（如 csk_abcd...mnop）
     pub masked_key: String,
+    /// 完整明文 Key，供列表二次复制；旧数据缺失明文时为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,

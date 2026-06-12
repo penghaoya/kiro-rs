@@ -798,6 +798,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
     ClientKeyItem {
         id: k.id,
         masked_key: display_client_key(k),
+        key: if k.key.is_empty() { None } else { Some(k.key.clone()) },
         name: k.name.clone(),
         description: k.description.clone(),
         disabled: k.disabled,
