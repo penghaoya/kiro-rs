@@ -1,6 +1,8 @@
 /target
 /CLAUDE.md
 /AGENTS.md
+# 本地运行时数据目录（凭据、缓存、日志、追踪库等，与 docker-compose 挂载约定一致）
+/data/
 /config.json
 /credentials.json
 /.idea
@@ -15,6 +17,9 @@
 /prompt_cache.json
 # 客户端 Key 分发（含明文 csk_*，绝对不能提交）
 /client_api_keys.json
+/client_api_keys.secret
+# 缓存计量落盘（运行时产物）
+/cache_metering.json
 # 按天滚动的请求用量日志
 /usage_log.*.jsonl
 /usage_stats.json
