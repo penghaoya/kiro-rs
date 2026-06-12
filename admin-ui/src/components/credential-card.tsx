@@ -10,11 +10,13 @@ import {
   MoreHorizontal,
   RotateCcw,
   Zap,
-  ZapOff,
   Clock,
   ScrollText,
   Boxes,
   Server,
+  Copy,
+  Check,
+  KeyRound,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -127,53 +129,47 @@ function formatRateLimitCountdown(ms: number): string {
  *  这里用固定 10000 作为进度条参照，使超额条能反映真实占比而非恒满。 */
 const OVERAGE_CAP = 10000;
 
+/** 按认证方式给字母头像着色（参考 kiro-account-manager 的 provider 配色） */
+function avatarColorClass(authMethod: string | null): string {
+  switch (authMethod) {
+    case "social":
+      return "bg-red-500/10 text-red-500";
+    case "idc":
+      return "bg-blue-500/10 text-blue-500";
+    case "api_key":
+      return "bg-slate-500/10 text-slate-500";
+    default:
+      return "bg-primary/10 text-primary";
+  }
+}
+
 /**
- * 紧凑超额状态胶囊 — 与订阅徽章并列展示，不占整行
- * 三态：已开（绿色实色）/ 未开（中性细描边）/ 不支持（灰色虚边小字）
+ * 卡片右上角的单一状态胶囊（uppercase 小字号，参考 AccountCard 风格）。
+ * 多状态共存时按严重程度取一个：禁用 > 风控冷却 > 429 限流 > 超额 > 正常。
  */
-function OverageStatusPill({ balance }: { balance: BalanceResponse }) {
-  const cap = balance.overageCapable;
-  const on = balance.overageEnabled === true;
-
-  // 不支持的订阅：极弱化
-  if (cap === false) return null;
-
-  if (on) {
-    return (
-      <span
-        className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 h-6 text-[11px] font-medium text-emerald-700 dark:text-emerald-400"
-        title="此账号已开启超额计费"
-      >
-        <Zap className="h-3 w-3" />
-        超额计费
-      </span>
-    );
-  }
-
-  if (cap === true) {
-    return (
-      <span
-        className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-transparent px-2 h-6 text-[11px] font-medium text-amber-600 dark:text-amber-400"
-        title="此账号支持超额但当前未开启"
-      >
-        <ZapOff className="h-3 w-3" />
-        未开超额
-      </span>
-    );
-  }
-
-  // 未知：低调灰色，hover 看原始值
+function StatusPill({
+  label,
+  tone,
+  title,
+}: {
+  label: string;
+  tone: "green" | "red" | "orange" | "amber" | "sky" | "slate";
+  title?: string;
+}) {
+  const toneClass = {
+    green: "bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20",
+    red: "bg-red-500/10 text-red-500 border-red-500/20",
+    orange: "bg-orange-500/10 text-orange-500 border-orange-500/20",
+    amber: "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20",
+    sky: "bg-sky-500/10 text-sky-600 dark:text-sky-400 border-sky-500/20",
+    slate: "bg-slate-500/10 text-slate-500 border-slate-500/20",
+  }[tone];
   return (
     <span
-      className="inline-flex items-center gap-1 rounded-full border border-dashed border-border/60 bg-transparent px-2 h-6 text-[11px] text-muted-foreground"
-      title={
-        balance.overageCapabilityRaw
-          ? `overageCapability = ${balance.overageCapabilityRaw}`
-          : "上游未返回 overageCapability"
-      }
+      className={`inline-flex shrink-0 items-center whitespace-nowrap rounded border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${toneClass}`}
+      title={title}
     >
-      <ZapOff className="h-3 w-3" />
-      未知
+      {label}
     </span>
   );
 }
@@ -227,6 +223,7 @@ export function CredentialCard({
   const [endpointValue, setEndpointValue] = useState(
     credential.configuredEndpoint ?? "",
   );
+  const [copied, setCopied] = useState(false);
 
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
@@ -416,133 +413,190 @@ export function CredentialCard({
   const isThrottled = !credential.disabled && throttleRemaining > 0;
   const isRateLimited = !credential.disabled && rateLimitRemainingMs > 0;
 
+  const displayName = credential.email || `凭据 #${credential.id}`;
+  const handleCopyName = async () => {
+    try {
+      await navigator.clipboard.writeText(displayName);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      toast.error("复制失败");
+    }
+  };
+
+  // 状态胶囊：多状态共存时取最重要的一个
+  const statusPill = credential.disabled
+    ? {
+        label: reasonStyle ? `禁用 · ${reasonStyle.label}` : "已禁用",
+        tone:
+          reasonStyle?.variant === "warning"
+            ? ("amber" as const)
+            : reasonStyle?.variant === "secondary"
+              ? ("slate" as const)
+              : ("red" as const),
+        title: credential.disabledReason ?? "已禁用",
+      }
+    : isThrottled
+      ? {
+          label: `冷却 ${formatThrottleCountdown(throttleRemaining)}`,
+          tone: "orange" as const,
+          title: "账号级风控冷却中（429 + suspicious activity），到期或手动解除后恢复调度",
+        }
+      : isRateLimited
+        ? {
+            label: `429 ${formatRateLimitCountdown(rateLimitRemainingMs)}`,
+            tone: "sky" as const,
+            title: "普通 429 限流冷却中，调度会临时跳过此凭据",
+          }
+        : isQuotaExceeded
+          ? {
+              label: "超额中",
+              tone: "amber" as const,
+              title: "基础额度已用满",
+            }
+          : {
+              label: "正常",
+              tone: "green" as const,
+              title: "状态正常",
+            };
+
   return (
     <>
       <Card
         ref={setNodeRef}
         style={dragStyle}
         data-credential-id={credential.id}
-        className={`group flex h-full flex-col ${
+        className={`group relative flex h-full flex-col ${
           isDragging
             ? "shadow-apple-lg opacity-80"
             : "hover:-translate-y-0.5 hover:shadow-apple-lg"
         } ${
-          credential.isCurrent ? "ring-2 ring-primary/60 shadow-apple-lg" : ""
+          // 状态驱动的卡片配色（参考 kiro-account-manager）：选中 > 活跃 > 异常 > 默认
+          selected
+            ? "ring-2 ring-primary/50 bg-primary/[0.03]"
+            : credential.isCurrent
+              ? "ring-1 ring-emerald-500/50 bg-emerald-500/[0.03] shadow-emerald-500/10"
+              : disabledByQuota
+                ? "ring-1 ring-amber-500/70 bg-amber-50/40 dark:bg-amber-500/[0.04]"
+                : isThrottled
+                  ? "ring-1 ring-orange-500/60 bg-orange-50/40 dark:bg-orange-500/[0.04]"
+                  : isRateLimited
+                    ? "ring-1 ring-sky-500/50 bg-sky-50/40 dark:bg-sky-500/[0.04]"
+                    : !credential.disabled && isQuotaExceeded
+                      ? "ring-1 ring-amber-500/60"
+                      : ""
         } ${
-          // 未禁用但已超额：琥珀色提醒边
-          !credential.disabled && isQuotaExceeded
-            ? "ring-1 ring-amber-500/60"
-            : ""
-        } ${
-          // 已因超额被禁用：琥珀色实色边 + 不灰化（保留可读性，方便审视）
-          disabledByQuota
-            ? "ring-1 ring-amber-500/70 bg-amber-50/40 dark:bg-amber-500/[0.04]"
-            : ""
-        } ${
-          // 账号级风控冷却中：橙红色提示边
-          isThrottled
-            ? "ring-1 ring-orange-500/60 bg-orange-50/40 dark:bg-orange-500/[0.04]"
-            : ""
-        } ${
-          // 普通 429 限流冷却：短冷却，区别于账号级 suspicious activity 风控
-          isRateLimited && !isThrottled
-            ? "ring-1 ring-sky-500/50 bg-sky-50/40 dark:bg-sky-500/[0.04]"
-            : ""
-        } ${
-          // 其他原因被禁用：常规灰化
-          credential.disabled && !disabledByQuota ? "opacity-70" : ""
+          // 其他原因被禁用：灰化去色（额度禁用保留可读性，方便审视）
+          credential.disabled && !disabledByQuota ? "opacity-60 grayscale" : ""
         }`}
       >
+        {/* 活跃凭据：顶部渐变条 */}
+        {credential.isCurrent && (
+          <div className="pointer-events-none absolute -left-px -right-px -top-px z-10 h-1 rounded-t-2xl bg-gradient-to-r from-emerald-500/80 to-green-400/80" />
+        )}
+
         <CardHeader className="p-4 pb-2.5">
-          <div className="flex items-start gap-3">
+          <div className="flex items-start gap-2.5">
             <label
               data-no-rect-select
-              className="mt-0.5 flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-accent"
+              className="mt-1.5 flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-accent"
               onClick={(e) => {
                 // label + Checkbox 双击事件去重，避免触发两次 onCheckedChange
                 e.stopPropagation();
               }}
             >
               <Checkbox
-                className="h-5 w-5 [&_svg]:h-4 [&_svg]:w-4"
+                className="h-4 w-4"
                 checked={selected}
                 onCheckedChange={onToggleSelect}
               />
             </label>
-            <div className="flex-1 min-w-0">
-              <CardTitle className="truncate text-[15px]">
-                {credential.email || `凭据 #${credential.id}`}
-              </CardTitle>
-              <div className="mt-1.5 flex flex-wrap items-center gap-1">
-                {balance?.subscriptionTitle && (
-                  <SubscriptionBadge title={balance.subscriptionTitle} />
-                )}
-                {credential.isCurrent && <Badge variant="success">活跃</Badge>}
-                <Badge
-                  variant="outline"
-                  className="gap-1 font-normal"
-                  title={
-                    credential.configuredEndpoint
-                      ? `显式 endpoint: ${credential.configuredEndpoint}；生效 endpoint: ${credential.effectiveEndpoint}`
-                      : `跟随默认 endpoint；生效 endpoint: ${credential.effectiveEndpoint}`
-                  }
+            {/* 字母头像：按认证方式着色 */}
+            <div
+              className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border/50 text-sm font-bold ${avatarColorClass(credential.authMethod)}`}
+            >
+              {displayName[0].toUpperCase()}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1">
+                <CardTitle className="truncate text-[14px]">
+                  {displayName}
+                </CardTitle>
+                <button
+                  type="button"
+                  onClick={handleCopyName}
+                  className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:bg-muted/80 hover:text-primary"
+                  title="复制账号"
                 >
-                  <Server className="h-3 w-3 opacity-70" />
-                  {credential.configuredEndpoint || credential.effectiveEndpoint}
-                </Badge>
-                {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
-                {credential.disabled && reasonStyle && (
-                  <Badge variant={reasonStyle.variant}>
-                    已禁用 · {reasonStyle.label}
-                  </Badge>
-                )}
-                {credential.disabled && !reasonStyle && (
-                  <Badge variant="destructive">已禁用</Badge>
-                )}
-                {/* 仍启用但已经达到上限：黄色"已超额"徽章 */}
-                {!credential.disabled && isQuotaExceeded && (
-                  <Badge variant="warning">超出额度</Badge>
-                )}
-                {isThrottled && (
-                  <Badge
-                    variant="warning"
-                    className="bg-orange-500/15 text-orange-700 dark:text-orange-300 border-orange-500/30"
-                    title="账号级风控冷却中（429 + suspicious activity），到期或手动解除后恢复调度"
-                  >
-                    <Clock className="mr-1 h-3 w-3" />
-                    冷却 {formatThrottleCountdown(throttleRemaining)}
-                  </Badge>
-                )}
-                {isRateLimited && (
-                  <Badge
-                    variant="outline"
-                    className="border-sky-500/30 bg-sky-500/10 text-sky-700 dark:text-sky-300"
-                    title="普通 429 限流冷却中，调度会临时跳过此凭据"
-                  >
-                    <Clock className="mr-1 h-3 w-3" />
-                    429 {formatRateLimitCountdown(rateLimitRemainingMs)}
-                  </Badge>
-                )}
-                {credential.authMethod && (
-                  <Badge variant="secondary">{authLabel}</Badge>
-                )}
-                {/* 配置元信息合并为单个徽章，减少换行。Endpoint 已在上方单独展示。 */}
-                {credential.hasProfileArn && (
-                  <Badge
-                    variant="outline"
-                    title="已配置 Profile ARN"
-                  >
-                    ARN
-                  </Badge>
-                )}
+                  {copied ? (
+                    <Check className="h-3 w-3 text-emerald-500" />
+                  ) : (
+                    <Copy className="h-3 w-3" />
+                  )}
+                </button>
+              </div>
+              <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                Kiro {authLabel ?? "未知"} 账号 · #{credential.id}
               </div>
             </div>
-            <Switch
-              checked={!credential.disabled}
-              onCheckedChange={handleToggleDisabled}
-              disabled={setDisabled.isPending}
-              title={credential.disabled ? "启用" : "禁用"}
-            />
+            {/* 右上角：超额开关 + 启用开关 + 状态胶囊 */}
+            <div className="flex shrink-0 items-center gap-2 pt-0.5">
+              {balance?.overageCapable === true && (
+                <div
+                  className="flex items-center gap-1"
+                  title={
+                    balance.overageEnabled
+                      ? "已开启超额计费，点击关闭"
+                      : "支持超额但未开启，点击开启"
+                  }
+                >
+                  <Zap
+                    className={`h-3 w-3 ${balance.overageEnabled ? "text-emerald-500" : "text-muted-foreground/60"}`}
+                  />
+                  <Switch
+                    size="sm"
+                    checked={balance.overageEnabled === true}
+                    disabled={overageBusy}
+                    onCheckedChange={handleSetOverage}
+                  />
+                </div>
+              )}
+              <Switch
+                size="sm"
+                checked={!credential.disabled}
+                onCheckedChange={handleToggleDisabled}
+                disabled={setDisabled.isPending}
+                title={credential.disabled ? "启用凭据" : "禁用凭据"}
+              />
+              <StatusPill {...statusPill} />
+            </div>
+          </div>
+
+          {/* 徽章行：订阅 / 认证方式 / Endpoint / ARN */}
+          <div className="flex flex-wrap items-center gap-1 pt-1">
+            {balance?.subscriptionTitle && (
+              <SubscriptionBadge title={balance.subscriptionTitle} />
+            )}
+            {credential.authMethod && (
+              <Badge variant="secondary">{authLabel}</Badge>
+            )}
+            <Badge
+              variant="outline"
+              className="gap-1 font-normal"
+              title={
+                credential.configuredEndpoint
+                  ? `显式 endpoint: ${credential.configuredEndpoint}；生效 endpoint: ${credential.effectiveEndpoint}`
+                  : `跟随默认 endpoint；生效 endpoint: ${credential.effectiveEndpoint}`
+              }
+            >
+              <Server className="h-3 w-3 opacity-70" />
+              {credential.configuredEndpoint || credential.effectiveEndpoint}
+            </Badge>
+            {credential.hasProfileArn && (
+              <Badge variant="outline" title="已配置 Profile ARN">
+                ARN
+              </Badge>
+            )}
           </div>
         </CardHeader>
 
@@ -705,7 +759,7 @@ export function CredentialCard({
                 );
                 return (
                   <div className="flex flex-1 flex-col gap-3">
-                    {/* 主行：剩余 / 超额金额（与标签同基线）+ 超额能力 */}
+                    {/* 主行：剩余 / 超额金额（与标签同基线） */}
                     <div className="flex items-baseline justify-between gap-3">
                       <div className="flex items-baseline gap-2 min-w-0">
                         <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
@@ -725,7 +779,6 @@ export function CredentialCard({
                             : `$${formatNumber(balance.remaining)}`}
                         </span>
                       </div>
-                      <OverageStatusPill balance={balance} />
                     </div>
 
                     {/* 基础额度条 */}
@@ -805,31 +858,42 @@ export function CredentialCard({
             )}
           </div>
 
-          {/* 操作区 */}
-          <div className="mt-auto flex items-center justify-between gap-2 border-t border-border/50 pt-3">
-            <div className="flex items-center gap-1">
-              <Button
-                ref={setActivatorNodeRef}
-                size="icon"
-                variant="ghost"
-                data-no-rect-select
-                className="cursor-grab touch-none active:cursor-grabbing"
-                title="拖拽调整优先级"
-                {...attributes}
-                {...listeners}
-              >
-                <GripVertical className="h-4 w-4 text-muted-foreground" />
-              </Button>
-              <span className="mx-1 h-5 w-px bg-border/70" />
-              <Button
-                size="sm"
-                variant="ghost"
+          {/* 操作区：主操作（编辑）+ 图标按钮组（参考 AccountCard 的布局） */}
+          <div className="mt-auto flex items-center gap-1 border-t border-border/50 pt-2.5">
+            <Button
+              ref={setActivatorNodeRef}
+              size="icon"
+              variant="ghost"
+              data-no-rect-select
+              className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing"
+              title="拖拽调整优先级"
+              {...attributes}
+              {...listeners}
+            >
+              <GripVertical className="h-4 w-4 text-muted-foreground" />
+            </Button>
+
+            {/* 主操作：编辑 */}
+            <button
+              type="button"
+              onClick={() => setShowEditDialog(true)}
+              className="inline-flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md bg-primary/10 px-2 text-xs font-medium text-primary transition-colors hover:bg-primary/20"
+            >
+              <Pencil className="h-3.5 w-3.5" />
+              编辑
+            </button>
+
+            {/* 次操作：图标按钮组 */}
+            <div className="ml-0.5 flex items-center gap-0.5 border-l border-border/50 pl-1">
+              <button
+                type="button"
                 onClick={handleForceRefresh}
                 disabled={
                   forceRefresh.isPending ||
                   credential.disabled ||
                   credential.authMethod === "api_key"
                 }
+                className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-primary disabled:opacity-40"
                 title={
                   credential.authMethod === "api_key"
                     ? "API Key 无需刷新"
@@ -838,37 +902,53 @@ export function CredentialCard({
                       : "强制刷新 Token"
                 }
               >
-                <RefreshCw
-                  className={`h-3.5 w-3.5 ${forceRefresh.isPending ? "animate-spin" : ""}`}
+                <KeyRound
+                  className={`h-4 w-4 ${forceRefresh.isPending ? "animate-spin" : ""}`}
                 />
-                <span className="hidden sm:inline">刷新 Token</span>
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
+              </button>
+              <button
+                type="button"
                 onClick={onRefreshBalance}
                 disabled={loadingBalance || credential.disabled}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-primary disabled:opacity-40"
                 title={credential.disabled ? "已禁用" : "刷新余额"}
               >
                 <RefreshCw
-                  className={`h-3.5 w-3.5 ${loadingBalance ? "animate-spin" : ""}`}
+                  className={`h-4 w-4 ${loadingBalance ? "animate-spin" : ""}`}
                 />
-                <span className="hidden sm:inline">刷新余额</span>
-              </Button>
-            </div>
-
-            <div className="flex items-center gap-1">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => setShowEditDialog(true)}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowFailuresDialog(true)}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                title="查看失败日志"
               >
-                <Pencil className="h-3.5 w-3.5" />
-                编辑
-              </Button>
+                <ScrollText className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!credential.disabled) {
+                    toast.error("请先禁用凭据再删除");
+                    return;
+                  }
+                  setShowDeleteDialog(true);
+                }}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+                title={
+                  credential.disabled ? "删除凭据" : "请先禁用凭据再删除"
+                }
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <Button size="icon" variant="ghost" title="更多操作">
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-8 w-8"
+                    title="更多操作"
+                  >
                     <MoreHorizontal className="h-4 w-4" />
                   </Button>
                 </DropdownMenuTrigger>
@@ -927,30 +1007,6 @@ export function CredentialCard({
                       ）
                     </DropdownMenuItem>
                   )}
-                  {balance?.overageCapable === true &&
-                    (balance.overageEnabled ? (
-                      <DropdownMenuItem
-                        onSelect={(e) => {
-                          e.preventDefault();
-                          handleSetOverage(false);
-                        }}
-                        disabled={overageBusy}
-                      >
-                        <ZapOff />
-                        关闭超额
-                      </DropdownMenuItem>
-                    ) : (
-                      <DropdownMenuItem
-                        onSelect={(e) => {
-                          e.preventDefault();
-                          handleSetOverage(true);
-                        }}
-                        disabled={overageBusy}
-                      >
-                        <Zap className="text-emerald-500" />
-                        开启超额
-                      </DropdownMenuItem>
-                    ))}
                   {credential.authMethod !== "api_key" && (
                     <DropdownMenuSeparator />
                   )}
@@ -970,22 +1026,6 @@ export function CredentialCard({
                       重新导入 Token
                     </DropdownMenuItem>
                   )}
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    destructive
-                    disabled={!credential.disabled}
-                    onSelect={(e) => {
-                      e.preventDefault();
-                      if (!credential.disabled) {
-                        toast.error("请先禁用凭据再删除");
-                        return;
-                      }
-                      setShowDeleteDialog(true);
-                    }}
-                  >
-                    <Trash2 />
-                    删除凭据
-                  </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
