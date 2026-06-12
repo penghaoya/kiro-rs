@@ -14,6 +14,21 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      // 在首屏渲染前同步主题，避免暗色用户看到一闪的亮色（FOUC）。
+      // 与 use-dark-mode.ts 的存储键和回退逻辑保持一致。
+      (function () {
+        try {
+          var t = localStorage.getItem("kiro-admin-theme");
+          var dark =
+            t === "dark" ||
+            (t !== "light" &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (dark) document.documentElement.classList.add("dark");
+        } catch (e) {}
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

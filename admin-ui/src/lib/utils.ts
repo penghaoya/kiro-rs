@@ -289,3 +289,41 @@ export function generateApiKey(prefix: string = 'sk-kiro-', randomLen: number = 
   }
   return prefix + out
 }
+
+/**
+ * 带并发上限的批量执行：对 items 逐个调用 worker，最多同时跑 concurrency 个。
+ * 每完成一个调用 onProgress(已完成数, 总数)。
+ * 单个失败不会中断整体；结果数组与 items 一一对应（成功 ok=true，失败 ok=false 带 error）。
+ *
+ * 用于批量删除 / 恢复 / 刷新 Token 等彼此独立的操作：相比串行 await 大幅缩短总耗时，
+ * 又通过并发上限避免一次性打爆后端。验活 / 查余额这类怕触发风控的操作不要用它（仍应串行 + 间隔）。
+ */
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+  onProgress?: (completed: number, total: number) => void,
+): Promise<{ ok: boolean; value?: R; error?: unknown }[]> {
+  const total = items.length
+  const results: { ok: boolean; value?: R; error?: unknown }[] = new Array(total)
+  let completed = 0
+  let cursor = 0
+  const limit = Math.max(1, Math.min(concurrency, total))
+
+  async function runOne(): Promise<void> {
+    while (cursor < total) {
+      const index = cursor++
+      try {
+        const value = await worker(items[index], index)
+        results[index] = { ok: true, value }
+      } catch (error) {
+        results[index] = { ok: false, error }
+      }
+      completed++
+      onProgress?.(completed, total)
+    }
+  }
+
+  await Promise.all(Array.from({ length: limit }, runOne))
+  return results
+}

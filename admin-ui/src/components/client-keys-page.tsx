@@ -14,6 +14,7 @@ import {
   useClientKeys, useCreateClientKey, useDeleteClientKey,
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
 } from '@/hooks/use-client-keys'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -40,6 +41,7 @@ export function ClientKeysPage() {
   const setDisabled = useSetClientKeyDisabled()
   const resetStats = useResetClientKeyStats()
   const updateKey = useUpdateClientKey()
+  const confirm = useConfirm()
 
   const [createOpen, setCreateOpen] = useState(false)
   const [createName, setCreateName] = useState('')
@@ -72,7 +74,13 @@ export function ClientKeysPage() {
   }
 
   const handleDelete = async (item: ClientKeyItem) => {
-    if (!confirm(`确认删除 Key "${item.name}"？此操作无法撤销。`)) return
+    const ok = await confirm({
+      title: '删除客户端 Key',
+      description: `确认删除 Key "${item.name}"？此操作无法撤销。`,
+      confirmText: '删除',
+      destructive: true,
+    })
+    if (!ok) return
     try {
       await deleteKey.mutateAsync(item.id)
       toast.success(`已删除 Key #${item.id}`)
@@ -91,7 +99,12 @@ export function ClientKeysPage() {
   }
 
   const handleReset = async (item: ClientKeyItem) => {
-    if (!confirm(`重置 Key "${item.name}" 的累计统计？`)) return
+    const ok = await confirm({
+      title: '重置统计',
+      description: `重置 Key "${item.name}" 的累计统计？`,
+      confirmText: '重置',
+    })
+    if (!ok) return
     try {
       await resetStats.mutateAsync(item.id)
       toast.success('统计已重置')

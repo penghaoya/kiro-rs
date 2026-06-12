@@ -79,8 +79,6 @@ import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
 import { ImageUpdateDialog } from "@/components/image-update-dialog";
 import {
   useCredentials,
-  useDeleteCredential,
-  useResetFailure,
   useLoadBalancingMode,
   useSetLoadBalancingMode,
   useResetAllSuccessCount,
@@ -91,6 +89,8 @@ import {
 import { useUpdateCheck } from "@/hooks/use-update-check";
 import { useFailureStats } from "@/hooks/use-traces";
 import { useRectSelect } from "@/hooks/use-rect-select";
+import { useDarkMode } from "@/hooks/use-dark-mode";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   DndContext,
   PointerSensor,
@@ -107,6 +107,8 @@ import {
 import {
   getCredentialBalance,
   forceRefreshToken,
+  deleteCredential as apiDeleteCredential,
+  resetCredentialFailure as apiResetFailure,
   updateAdminKey,
   disableQuotaExceeded,
   updateApiKey,
@@ -118,6 +120,7 @@ import {
   parseError,
   generateApiKey,
   formatNumber,
+  mapWithConcurrency,
 } from "@/lib/utils";
 import type { BalanceResponse } from "@/types/api";
 import type { RetryMode, RetryPolicy } from "@/api/credentials";
@@ -201,7 +204,7 @@ function RetryPolicyPanel() {
   };
 
   return (
-    <div className="mb-6 rounded-xl border border-border/60 bg-card/70 p-4 shadow-apple">
+    <div className="mb-5 rounded-xl border border-border/60 bg-card/70 p-4 shadow-apple">
       <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
         <div className="min-w-0 space-y-3">
           <div className="flex flex-wrap items-center gap-2">
@@ -374,17 +377,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const cancelVerifyRef = useRef(false);
   const [currentPage, setCurrentPage] = useState(1);
   const itemsPerPage = 12;
-  const [darkMode, setDarkMode] = useState(() => {
-    if (typeof window !== "undefined") {
-      return document.documentElement.classList.contains("dark");
-    }
-    return false;
-  });
+  const { darkMode, toggle: toggleDarkMode } = useDarkMode();
 
   const queryClient = useQueryClient();
+  const confirm = useConfirm();
   const { data, isLoading, error, refetch } = useCredentials();
-  const { mutate: deleteCredential } = useDeleteCredential();
-  const { mutate: resetFailure } = useResetFailure();
   const { data: loadBalancingData, isLoading: isLoadingMode } =
     useLoadBalancingMode();
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } =
@@ -549,11 +546,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     });
   }, [data?.credentials]);
 
-  const toggleDarkMode = () => {
-    setDarkMode(!darkMode);
-    document.documentElement.classList.toggle("dark");
-  };
-
   const handleRefresh = () => {
     refetch();
     toast.success("已刷新凭据列表");
@@ -610,30 +602,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
     const skipped = selectedIds.size - disabledIds.length;
     const skippedText = skipped > 0 ? `（将跳过 ${skipped} 个未禁用凭据）` : "";
-    if (
-      !confirm(
-        `确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`,
-      )
-    )
-      return;
-    let s = 0,
-      f = 0;
-    for (const id of disabledIds) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(id, {
-            onSuccess: () => {
-              s++;
-              resolve();
-            },
-            onError: (err) => {
-              f++;
-              reject(err);
-            },
-          });
-        });
-      } catch {}
-    }
+    const ok = await confirm({
+      title: "删除已禁用凭据",
+      description: `确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`,
+      confirmText: "删除",
+      destructive: true,
+    });
+    if (!ok) return;
+    const results = await mapWithConcurrency(disabledIds, 5, (id) =>
+      apiDeleteCredential(id),
+    );
+    const s = results.filter((r) => r.ok).length;
+    const f = results.length - s;
+    queryClient.invalidateQueries({ queryKey: ["credentials"] });
     const sk = skipped > 0 ? `，已跳过 ${skipped} 个未禁用凭据` : "";
     if (f === 0) toast.success(`成功删除 ${s} 个已禁用凭据${sk}`);
     else toast.warning(`删除已禁用凭据：成功 ${s} 个，失败 ${f} 个${sk}`);
@@ -653,24 +634,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.error("选中的凭据中没有失败的凭据");
       return;
     }
-    let s = 0,
-      f = 0;
-    for (const id of failedIds) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          resetFailure(id, {
-            onSuccess: () => {
-              s++;
-              resolve();
-            },
-            onError: (err) => {
-              f++;
-              reject(err);
-            },
-          });
-        });
-      } catch {}
-    }
+    const results = await mapWithConcurrency(failedIds, 5, (id) =>
+      apiResetFailure(id),
+    );
+    const s = results.filter((r) => r.ok).length;
+    const f = results.length - s;
+    queryClient.invalidateQueries({ queryKey: ["credentials"] });
     if (f === 0) toast.success(`成功恢复 ${s} 个凭据`);
     else toast.warning(`成功 ${s} 个，失败 ${f} 个`);
     deselectAll();
@@ -691,17 +660,15 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
     setBatchRefreshing(true);
     setBatchRefreshProgress({ current: 0, total: enabledIds.length });
-    let s = 0,
-      f = 0;
-    for (let i = 0; i < enabledIds.length; i++) {
-      try {
-        await forceRefreshToken(enabledIds[i]);
-        s++;
-      } catch {
-        f++;
-      }
-      setBatchRefreshProgress({ current: i + 1, total: enabledIds.length });
-    }
+    // 刷新 Token 会打上游，并发上限设保守的 3，避免触发上游限流
+    const results = await mapWithConcurrency(
+      enabledIds,
+      3,
+      (id) => forceRefreshToken(id),
+      (current, total) => setBatchRefreshProgress({ current, total }),
+    );
+    const s = results.filter((r) => r.ok).length;
+    const f = results.length - s;
     setBatchRefreshing(false);
     queryClient.invalidateQueries({ queryKey: ["credentials"] });
     if (f === 0) toast.success(`成功刷新 ${s} 个凭据的 Token`);
@@ -719,30 +686,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.error("没有可清除的已禁用凭据");
       return;
     }
-    if (
-      !confirm(
-        `确定要清除所有 ${disabled.length} 个已禁用凭据吗？此操作无法撤销。`,
-      )
-    )
-      return;
-    let s = 0,
-      f = 0;
-    for (const c of disabled) {
-      try {
-        await new Promise<void>((resolve, reject) => {
-          deleteCredential(c.id, {
-            onSuccess: () => {
-              s++;
-              resolve();
-            },
-            onError: (err) => {
-              f++;
-              reject(err);
-            },
-          });
-        });
-      } catch {}
-    }
+    const ok = await confirm({
+      title: "清除已禁用凭据",
+      description: `确定要清除所有 ${disabled.length} 个已禁用凭据吗？此操作无法撤销。`,
+      confirmText: "清除",
+      destructive: true,
+    });
+    if (!ok) return;
+    const results = await mapWithConcurrency(disabled, 5, (c) =>
+      apiDeleteCredential(c.id),
+    );
+    const s = results.filter((r) => r.ok).length;
+    const f = results.length - s;
+    queryClient.invalidateQueries({ queryKey: ["credentials"] });
     if (f === 0) toast.success(`成功清除所有 ${s} 个已禁用凭据`);
     else toast.warning(`清除已禁用凭据：成功 ${s} 个，失败 ${f} 个`);
     deselectAll();
@@ -884,8 +840,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.info('当前没有已超额的凭据，可先点击"刷新当前页余额"');
       return;
     }
-    if (!confirm(`确定要把 ${quotaExceededCount} 个已超额的凭据全部禁用吗？`))
-      return;
+    const ok = await confirm({
+      title: "一键超额禁用",
+      description: `确定要把 ${quotaExceededCount} 个已超额的凭据全部禁用吗？`,
+      confirmText: "全部禁用",
+      destructive: true,
+    });
+    if (!ok) return;
     setDisablingQuota(true);
     try {
       const res = await disableQuotaExceeded();
@@ -911,12 +872,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.info("当前没有明确「未开启超额」的凭据");
       return;
     }
-    if (
-      !confirm(
-        `确定要为 ${overageEnableableCount} 个凭据开启超额吗？开启后超出额度将按 overageRate 计费。`,
-      )
-    )
-      return;
+    const ok = await confirm({
+      title: "一键开启超额",
+      description: `确定要为 ${overageEnableableCount} 个凭据开启超额吗？开启后超出额度将按 overageRate 计费。`,
+      confirmText: "开启超额",
+    });
+    if (!ok) return;
     setEnablingOverage(true);
     try {
       const res = await enableOverageForAllCapable();
@@ -1242,7 +1203,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-8"}
       >
         {/* 大标题 */}
-        <div className="mb-6 flex items-end justify-between gap-4">
+        <div className="mb-5 flex items-end justify-between gap-4">
           <div>
             <h1 className="text-[28px] font-semibold tracking-tight leading-tight">
               凭据管理
@@ -1254,34 +1215,34 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         </div>
 
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
+        <div className="grid gap-3 md:grid-cols-3 mb-5">
           <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-5">
+            <CardContent className="p-4">
               <div className="text-[13px] font-medium text-muted-foreground">
                 凭据总数
               </div>
-              <div className="mt-2 text-3xl font-semibold tracking-tight tabular-nums">
+              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums">
                 {formatNumber(data?.total)}
               </div>
             </CardContent>
           </Card>
           <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-5">
+            <CardContent className="p-4">
               <div className="text-[13px] font-medium text-muted-foreground">
                 可用凭据
               </div>
-              <div className="mt-2 text-3xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400">
+              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400">
                 {formatNumber(data?.available)}
               </div>
             </CardContent>
           </Card>
           <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-5">
+            <CardContent className="p-4">
               <div className="text-[13px] font-medium text-muted-foreground">
                 当前活跃
               </div>
-              <div className="mt-2 flex items-center gap-2">
-                <span className="text-3xl font-semibold tracking-tight tabular-nums">
+              <div className="mt-1.5 flex items-center gap-2">
+                <span className="text-2xl font-semibold tracking-tight tabular-nums">
                   #{data?.currentId || "-"}
                 </span>
                 {data?.currentId && <Badge variant="success">活跃</Badge>}
@@ -1559,7 +1520,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 items={currentPageIds}
                 strategy={rectSortingStrategy}
               >
-                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 select-none">
+                <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3 select-none">
                   {currentCredentials.map((credential) => (
                     <CredentialCard
                       key={credential.id}

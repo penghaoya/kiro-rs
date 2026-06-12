@@ -1,5 +1,6 @@
 import { useState, useEffect, lazy, Suspense } from "react";
 import { storage } from "@/lib/storage";
+import { useDarkMode } from "@/hooks/use-dark-mode";
 import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
@@ -73,12 +74,7 @@ function readTabFromHash(): Tab {
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [tab, setTab] = useState<Tab>(readTabFromHash);
-  const [darkMode, setDarkMode] = useState(() => {
-    if (typeof window !== "undefined") {
-      return document.documentElement.classList.contains("dark");
-    }
-    return false;
-  });
+  const { darkMode, toggle: toggleDarkMode } = useDarkMode();
 
   useEffect(() => {
     if (storage.getApiKey()) setIsLoggedIn(true);
@@ -99,10 +95,6 @@ function App() {
   const handleLogout = () => {
     storage.removeApiKey();
     setIsLoggedIn(false);
-  };
-  const toggleDarkMode = () => {
-    setDarkMode((v) => !v);
-    document.documentElement.classList.toggle("dark");
   };
 
   if (!isLoggedIn) {

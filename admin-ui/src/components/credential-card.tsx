@@ -21,7 +21,6 @@ import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Progress } from "@/components/ui/progress";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -98,6 +97,15 @@ function formatResetDate(ts: number | null): string {
   return new Date(ts * 1000).toLocaleString("zh-CN");
 }
 
+/** 紧凑重置日期：MM/DD（用于余额面板底部，悬停看完整日期） */
+function formatResetShort(ts: number | null): string {
+  if (!ts) return "未知";
+  const d = new Date(ts * 1000);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${mm}/${dd}`;
+}
+
 /** 把秒数格式化为 `mm:ss` 或 `hh:mm:ss` */
 function formatThrottleCountdown(secs: number): string {
   const total = Math.max(0, Math.floor(secs));
@@ -113,6 +121,10 @@ function formatRateLimitCountdown(ms: number): string {
   if (ms < 1000) return `${Math.max(0, Math.ceil(ms))}ms`;
   return formatThrottleCountdown(Math.ceil(ms / 1000));
 }
+
+/** 超额额度总上限（美元）。上游未在 usageLimits 中返回超额硬上限，
+ *  这里用固定 10000 作为进度条参照，使超额条能反映真实占比而非恒满。 */
+const OVERAGE_CAP = 10000;
 
 /**
  * 紧凑超额状态胶囊 — 与订阅徽章并列展示，不占整行
@@ -440,7 +452,7 @@ export function CredentialCard({
           credential.disabled && !disabledByQuota ? "opacity-70" : ""
         }`}
       >
-        <CardHeader className="pb-3">
+        <CardHeader className="p-4 pb-2.5">
           <div className="flex items-start gap-3">
             <label
               data-no-rect-select
@@ -533,9 +545,9 @@ export function CredentialCard({
           </div>
         </CardHeader>
 
-        <CardContent className="flex flex-1 flex-col space-y-4">
+        <CardContent className="flex flex-1 flex-col space-y-3 p-4 pt-0">
           {/* 信息行 */}
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-[13px]">
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[13px]">
             <div className="flex items-center justify-between gap-2">
               <dt className="text-muted-foreground">优先级</dt>
               <dd>
@@ -664,7 +676,7 @@ export function CredentialCard({
 
           {/* 余额面板 */}
           <div
-            className={`flex min-h-[150px] flex-col rounded-xl border p-4 transition-colors ${
+            className={`flex min-h-[140px] flex-col rounded-xl border p-3.5 transition-colors ${
               isQuotaExceeded || disabledByQuota
                 ? "border-amber-500/40 bg-amber-50/60 dark:bg-amber-500/[0.06]"
                 : "border-border/60 bg-secondary/40"
@@ -676,50 +688,114 @@ export function CredentialCard({
                 正在查询余额…
               </div>
             ) : balance ? (
-              <div className="space-y-3">
-                <div className="flex items-end justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
-                      {balance.remaining < 0 ? "超额" : "余额"}
-                    </div>
-                    <div
-                      className={`mt-0.5 text-xl font-semibold tabular-nums ${
-                        balance.remaining < 0
-                          ? "text-red-600 dark:text-red-400"
-                          : balance.remaining === 0
-                            ? "text-amber-600 dark:text-amber-400"
-                            : "text-emerald-600 dark:text-emerald-400"
-                      }`}
-                    >
-                      {balance.remaining < 0
-                        ? `-$${formatNumber(Math.abs(balance.remaining))}`
-                        : `$${formatNumber(balance.remaining)}`}
-                    </div>
-                  </div>
-                  <div className="text-right min-w-0">
-                    <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
-                      超额
-                    </div>
-                    <div className="mt-1 flex items-center justify-end">
+              (() => {
+                const used = balance.currentUsage;
+                const limit = balance.usageLimit;
+                const overLimit = limit > 0 && used > limit;
+                const basePct =
+                  limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
+                const overageAmount = overLimit ? used - limit : 0;
+                // 超额条以固定的超额总上限（OVERAGE_CAP）为参照，反映真实占比，
+                // 而非旧实现里以基础额度为分母导致的恒满。
+                const overagePct = Math.min(
+                  100,
+                  (overageAmount / OVERAGE_CAP) * 100,
+                );
+                return (
+                  <div className="space-y-2.5">
+                    {/* 主行：剩余 / 超额金额 + 超额能力 */}
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
+                          {balance.remaining < 0 ? "已超额" : "剩余额度"}
+                        </div>
+                        <div
+                          className={`mt-0.5 text-xl font-semibold tabular-nums ${
+                            balance.remaining < 0
+                              ? "text-violet-600 dark:text-violet-400"
+                              : balance.remaining === 0
+                                ? "text-amber-600 dark:text-amber-400"
+                                : "text-emerald-600 dark:text-emerald-400"
+                          }`}
+                        >
+                          {balance.remaining < 0
+                            ? `-$${formatNumber(Math.abs(balance.remaining))}`
+                            : `$${formatNumber(balance.remaining)}`}
+                        </div>
+                      </div>
                       <OverageStatusPill balance={balance} />
                     </div>
+
+                    {/* 基础额度条 */}
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[11px] tabular-nums">
+                        <span className="text-muted-foreground">额度用量</span>
+                        <span
+                          className={
+                            overLimit
+                              ? "font-medium text-violet-600 dark:text-violet-400"
+                              : basePct > 80
+                                ? "font-medium text-amber-600 dark:text-amber-400"
+                                : "text-muted-foreground"
+                          }
+                        >
+                          ${formatNumber(Math.min(used, limit))} / $
+                          {formatNumber(limit)}
+                          {overLimit ? " · 已满" : ` · ${basePct.toFixed(0)}%`}
+                        </span>
+                      </div>
+                      <div className="relative h-2 w-full overflow-hidden rounded-full bg-secondary/80">
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ease-apple ${
+                            overLimit
+                              ? "bg-gradient-to-r from-violet-500 to-fuchsia-500"
+                              : basePct > 80
+                                ? "bg-gradient-to-r from-amber-400 to-orange-500"
+                                : "bg-gradient-to-r from-emerald-400 to-emerald-500"
+                          }`}
+                          style={{ width: `${basePct}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* 超额条（仅在已超额时出现，与基础额度清晰分离） */}
+                    {overLimit && (
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[11px] tabular-nums">
+                          <span className="flex items-center gap-1 font-medium text-violet-600 dark:text-violet-400">
+                            <Zap className="h-3 w-3" />
+                            超额用量
+                          </span>
+                          <span className="font-medium text-violet-600 dark:text-violet-400">
+                            +${formatNumber(overageAmount)} / $
+                            {formatNumber(OVERAGE_CAP)}
+                            <span className="ml-1 text-muted-foreground">
+                              {overagePct.toFixed(1)}%
+                            </span>
+                          </span>
+                        </div>
+                        <div className="relative h-2 w-full overflow-hidden rounded-full bg-violet-500/15">
+                          <div
+                            className="h-full rounded-full bg-gradient-to-r from-violet-500 to-fuchsia-500 transition-all duration-500 ease-apple"
+                            style={{ width: `${overagePct}%` }}
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {/* 重置 */}
+                    <div className="flex items-center justify-between border-t border-border/50 pt-1.5 text-[11px] text-muted-foreground">
+                      <span>额度重置</span>
+                      <span
+                        className="font-medium text-foreground"
+                        title={formatResetDate(balance.nextResetAt)}
+                      >
+                        {formatResetShort(balance.nextResetAt)}
+                      </span>
+                    </div>
                   </div>
-                </div>
-                <div className="space-y-1.5">
-                  <Progress value={balance.usagePercentage} />
-                  <div className="flex justify-between text-[11px] tabular-nums text-muted-foreground">
-                    <span>已用 ${formatNumber(balance.currentUsage)}</span>
-                    <span>{balance.usagePercentage.toFixed(1)}%</span>
-                    <span>额度 ${formatNumber(balance.usageLimit)}</span>
-                  </div>
-                </div>
-                <div className="border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
-                  下次重置：
-                  <span className="font-medium text-foreground">
-                    {formatResetDate(balance.nextResetAt)}
-                  </span>
-                </div>
-              </div>
+                );
+              })()
             ) : (
               <div className="flex flex-1 items-center justify-center text-center text-[13px] text-muted-foreground">
                 余额未查询，点击顶部"刷新当前页余额"即可加载。
