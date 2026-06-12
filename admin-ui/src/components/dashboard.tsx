@@ -27,6 +27,7 @@ import {
   Copy,
   Wand2,
   Zap,
+  ChevronDown,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -164,6 +165,7 @@ function RetryPolicyPanel() {
   const [customPolicy, setCustomPolicy] = useState<RetryPolicy>(
     defaultCustomRetryPolicy,
   );
+  const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
     if (data?.customPolicy) {
@@ -204,44 +206,54 @@ function RetryPolicyPanel() {
   };
 
   return (
-    <div className="mb-5 rounded-xl border border-border/60 bg-card/70 p-4 shadow-apple">
-      <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-        <div className="min-w-0 space-y-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <Activity className="h-4 w-4 text-primary" />
-            <h2 className="text-sm font-semibold tracking-tight">
-              429 重试策略
-            </h2>
-            {effective && (
-              <Badge variant="secondary">
-                冷却 {(effective.rateLimitCooldownMs / 1000).toFixed(1)}s · 重试{" "}
-                {effective.maxRequestRetries}
-              </Badge>
-            )}
-            {effective?.credentialSwitchOn429 && (
-              <Badge variant="outline">429 换凭据</Badge>
-            )}
-            {effective?.respectRetryAfter && (
-              <Badge variant="outline">Retry-After</Badge>
-            )}
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {modes.map((mode) => (
-              <Button
-                key={mode}
-                size="sm"
-                variant={activeMode === mode ? "default" : "outline"}
-                onClick={() => applyMode(mode)}
-                disabled={isLoading || setRetryPolicy.isPending}
-                title={retryModeDescriptions[mode]}
-              >
-                {retryModeLabels[mode]}
-              </Button>
-            ))}
-          </div>
-        </div>
+    <div className="mb-5 rounded-xl border border-border/60 bg-card/70 px-4 shadow-apple">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        className="flex w-full items-center gap-2 py-3 text-left"
+      >
+        <Activity className="h-4 w-4 shrink-0 text-primary" />
+        <h2 className="shrink-0 text-sm font-semibold tracking-tight">
+          429 重试策略
+        </h2>
+        <Badge variant="secondary" className="shrink-0">
+          {retryModeLabels[activeMode]}
+        </Badge>
+        {effective && (
+          <span className="hidden truncate text-xs text-muted-foreground sm:inline">
+            冷却 {(effective.rateLimitCooldownMs / 1000).toFixed(1)}s · 重试{" "}
+            {effective.maxRequestRetries}
+            {effective.credentialSwitchOn429 && " · 换凭据"}
+            {effective.respectRetryAfter && " · Retry-After"}
+          </span>
+        )}
+        <ChevronDown
+          className={`ml-auto h-4 w-4 shrink-0 text-muted-foreground transition-transform duration-200 ${
+            expanded ? "rotate-180" : ""
+          }`}
+        />
+      </button>
 
-        {activeMode === "custom" && (
+      {expanded && (
+        <div className="flex flex-col gap-4 pb-4 xl:flex-row xl:items-start xl:justify-between">
+          <div className="min-w-0 space-y-3">
+            <div className="flex flex-wrap gap-2">
+              {modes.map((mode) => (
+                <Button
+                  key={mode}
+                  size="sm"
+                  variant={activeMode === mode ? "default" : "outline"}
+                  onClick={() => applyMode(mode)}
+                  disabled={isLoading || setRetryPolicy.isPending}
+                  title={retryModeDescriptions[mode]}
+                >
+                  {retryModeLabels[mode]}
+                </Button>
+              ))}
+            </div>
+          </div>
+
+          {activeMode === "custom" && (
           <div className="grid w-full gap-3 sm:grid-cols-2 xl:max-w-3xl xl:grid-cols-3">
             <label className="text-xs font-medium text-muted-foreground">
               冷却 ms
@@ -328,8 +340,9 @@ function RetryPolicyPanel() {
               保存 Custom
             </Button>
           </div>
-        )}
-      </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1202,8 +1215,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         ref={gridRef}
         className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-8"}
       >
-        {/* 大标题 */}
-        <div className="mb-5 flex items-end justify-between gap-4">
+        {/* 大标题 + 概览指标 */}
+        <div className="mb-5 flex flex-wrap items-end justify-between gap-x-8 gap-y-4">
           <div>
             <h1 className="text-[28px] font-semibold tracking-tight leading-tight">
               凭据管理
@@ -1212,43 +1225,37 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               管理 Kiro 的所有访问凭据、负载均衡与登录信息
             </p>
           </div>
-        </div>
-
-        {/* 统计卡片 */}
-        <div className="grid gap-3 md:grid-cols-3 mb-5">
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-4">
-              <div className="text-[13px] font-medium text-muted-foreground">
-                凭据总数
-              </div>
-              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums">
+          <div className="flex items-center gap-6">
+            <div className="flex flex-col">
+              <span className="text-2xl font-semibold leading-none tracking-tight tabular-nums">
                 {formatNumber(data?.total)}
-              </div>
-            </CardContent>
-          </Card>
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-4">
-              <div className="text-[13px] font-medium text-muted-foreground">
-                可用凭据
-              </div>
-              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400">
+              </span>
+              <span className="mt-1.5 text-xs font-medium text-muted-foreground">
+                凭据总数
+              </span>
+            </div>
+            <div className="h-9 w-px bg-border/60" />
+            <div className="flex flex-col">
+              <span className="text-2xl font-semibold leading-none tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400">
                 {formatNumber(data?.available)}
-              </div>
-            </CardContent>
-          </Card>
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-4">
-              <div className="text-[13px] font-medium text-muted-foreground">
-                当前活跃
-              </div>
-              <div className="mt-1.5 flex items-center gap-2">
+              </span>
+              <span className="mt-1.5 text-xs font-medium text-muted-foreground">
+                可用凭据
+              </span>
+            </div>
+            <div className="h-9 w-px bg-border/60" />
+            <div className="flex flex-col">
+              <span className="flex items-center gap-1.5 leading-none">
                 <span className="text-2xl font-semibold tracking-tight tabular-nums">
                   #{data?.currentId || "-"}
                 </span>
                 {data?.currentId && <Badge variant="success">活跃</Badge>}
-              </div>
-            </CardContent>
-          </Card>
+              </span>
+              <span className="mt-1.5 text-xs font-medium text-muted-foreground">
+                当前活跃
+              </span>
+            </div>
+          </div>
         </div>
 
         <RetryPolicyPanel />

@@ -704,7 +704,7 @@ export function CredentialCard({
                   (overageAmount / OVERAGE_CAP) * 100,
                 );
                 return (
-                  <div className="space-y-2">
+                  <div className="flex flex-1 flex-col gap-3">
                     {/* 主行：剩余 / 超额金额（与标签同基线）+ 超额能力 */}
                     <div className="flex items-baseline justify-between gap-3">
                       <div className="flex items-baseline gap-2 min-w-0">
@@ -712,7 +712,7 @@ export function CredentialCard({
                           {balance.remaining < 0 ? "已超额" : "剩余"}
                         </span>
                         <span
-                          className={`text-2xl font-semibold tabular-nums leading-none ${
+                          className={`text-xl font-semibold tabular-nums leading-none ${
                             balance.remaining < 0
                               ? "text-violet-600 dark:text-violet-400"
                               : balance.remaining === 0
@@ -729,7 +729,7 @@ export function CredentialCard({
                     </div>
 
                     {/* 基础额度条 */}
-                    <div className="space-y-1">
+                    <div className="space-y-1.5">
                       <div className="flex items-center justify-between text-[11px] tabular-nums">
                         <span className="text-muted-foreground">额度用量</span>
                         <span
@@ -746,7 +746,7 @@ export function CredentialCard({
                           {overLimit ? " · 已满" : ` · ${basePct.toFixed(0)}%`}
                         </span>
                       </div>
-                      <div className="relative h-2 w-full overflow-hidden rounded-full bg-secondary/80">
+                      <div className="relative h-1 w-full overflow-hidden rounded-full bg-secondary/80">
                         <div
                           className={`h-full rounded-full transition-all duration-500 ease-apple ${
                             overLimit
@@ -762,7 +762,7 @@ export function CredentialCard({
 
                     {/* 超额条（仅在已超额时出现，与基础额度清晰分离） */}
                     {overLimit && (
-                      <div className="space-y-1">
+                      <div className="space-y-1.5">
                         <div className="flex items-center justify-between text-[11px] tabular-nums">
                           <span className="flex items-center gap-1 font-medium text-violet-600 dark:text-violet-400">
                             <Zap className="h-3 w-3" />
@@ -776,7 +776,7 @@ export function CredentialCard({
                             </span>
                           </span>
                         </div>
-                        <div className="relative h-2 w-full overflow-hidden rounded-full bg-violet-500/15">
+                        <div className="relative h-1 w-full overflow-hidden rounded-full bg-violet-500/15">
                           <div
                             className="h-full rounded-full bg-gradient-to-r from-violet-500 to-fuchsia-500 transition-all duration-500 ease-apple"
                             style={{ width: `${overagePct}%` }}
@@ -786,7 +786,7 @@ export function CredentialCard({
                     )}
 
                     {/* 重置 */}
-                    <div className="flex items-center justify-between border-t border-border/50 pt-1.5 text-[11px] text-muted-foreground">
+                    <div className="mt-auto flex items-center justify-between border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
                       <span>额度重置</span>
                       <span
                         className="font-medium text-foreground"
