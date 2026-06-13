@@ -12,7 +12,11 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useUpdateCredential } from '@/hooks/use-credentials'
 import { getProxyPool } from '@/api/credentials'
-import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
+import { extractErrorMessage } from '@/lib/utils'
+import {
+  formatProxyPoolOptionLabel,
+  sortProxyPoolEntries,
+} from '@/lib/proxy-display'
 import type { CredentialStatusItem } from '@/types/api'
 
 interface EditCredentialDialogProps {
@@ -76,7 +80,9 @@ export function EditCredentialDialog({
     )
   }
 
-  const enabledProxies = proxyPool?.proxies.filter(p => p.enabled) ?? []
+  const enabledProxies = sortProxyPoolEntries(
+    proxyPool?.proxies.filter((p) => p.enabled) ?? [],
+  )
 
   // 当前 proxyUrl 是否是自定义值（不匹配任何标准选项）
   const isCustomUrl = proxyUrl !== '' && proxyUrl !== 'direct' &&
@@ -140,9 +146,9 @@ export function EditCredentialDialog({
                 <option value="direct">直连（不使用代理）</option>
                 {enabledProxies.length > 0 && (
                   <optgroup label="代理池">
-                    {enabledProxies.map(p => (
+                    {enabledProxies.map((p) => (
                       <option key={p.id} value={p.url}>
-                        {p.label ? `${p.label} | ${maskProxyUrl(p.url)}` : maskProxyUrl(p.url)}
+                        {formatProxyPoolOptionLabel(p)}
                       </option>
                     ))}
                   </optgroup>
@@ -180,7 +186,7 @@ export function EditCredentialDialog({
                 />
               </div>
               <p className="text-xs text-muted-foreground">
-                用户名/密码留空表示不修改；代理 URL 已包含凭据时无需填写
+                代理池选项展示出口 IP，便于区分同 host 的不同 session；用户名/密码留空表示不修改
               </p>
             </div>
           </div>

@@ -39,7 +39,10 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { CredentialStatusItem, BalanceResponse } from "@/types/api";
-import { maskProxyUrl, maskEmail, extractErrorMessage } from "@/lib/utils";
+import { maskEmail, extractErrorMessage } from "@/lib/utils";
+import { formatCredentialProxyDisplay } from "@/lib/proxy-display";
+import { getProxyPool } from "@/api/credentials";
+import { useQuery } from "@tanstack/react-query";
 import {
   useSetDisabled,
   useSetPriority,
@@ -255,6 +258,15 @@ export function CredentialCard({
   const clearThrottle = useClearThrottle();
   const queryClient = useQueryClient();
   const { data: globalConfig } = useGlobalConfig();
+  const { data: proxyPoolData } = useQuery({
+    queryKey: ['proxy-pool'],
+    queryFn: getProxyPool,
+    staleTime: 60_000,
+  });
+  const proxyDisplay = formatCredentialProxyDisplay(
+    credential.proxyUrl,
+    proxyPoolData?.proxies,
+  );
 
   useEffect(() => {
     setEndpointValue(credential.configuredEndpoint ?? "");
@@ -784,11 +796,11 @@ export function CredentialCard({
                 {credential.hasProxy && (
                   <span
                     className="flex min-w-0 items-center gap-1"
-                    title={maskProxyUrl(credential.proxyUrl ?? "")}
+                    title={proxyDisplay.title}
                   >
                     代理
-                    <span className="truncate font-mono">
-                      {maskProxyUrl(credential.proxyUrl ?? "")}
+                    <span className="truncate font-medium text-foreground/80">
+                      {proxyDisplay.text}
                     </span>
                   </span>
                 )}
