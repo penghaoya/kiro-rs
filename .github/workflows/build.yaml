@@ -24,13 +24,13 @@ jobs:
     name: Admin UI
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('admin-ui/bun.lock') }}
@@ -43,7 +43,7 @@ jobs:
           bun install --frozen-lockfile --ignore-scripts
           bun run build
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: admin-ui-dist
           path: admin-ui/dist
@@ -54,9 +54,9 @@ jobs:
     needs: build-frontend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: admin-ui-dist
           path: admin-ui/dist
@@ -106,9 +106,9 @@ jobs:
             bin: kiro-rs.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: admin-ui-dist
           path: admin-ui/dist
@@ -149,7 +149,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Compress-Archive -Path $bin -DestinationPath "release/$out.zip" -Force
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.suffix }}
           path: release/
