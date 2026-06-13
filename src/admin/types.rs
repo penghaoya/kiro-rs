@@ -580,6 +580,7 @@ pub struct ProxyCheckAllResponse {
     pub healthy: usize,
     pub unhealthy: usize,
     pub auto_disabled: usize,
+    pub self_healed: usize,
 }
 
 /// 轮询批量分配请求

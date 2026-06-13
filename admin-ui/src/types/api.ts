@@ -258,6 +258,7 @@ export interface ProxyCheckAllResponse {
   healthy: number
   unhealthy: number
   autoDisabled: number
+  selfHealed: number
 }
 
 // 轮询批量分配请求

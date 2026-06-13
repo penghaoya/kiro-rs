@@ -1015,10 +1015,11 @@ impl AdminService {
                 let started = std::time::Instant::now();
                 let summary = svc.proxy_pool.check_all().await;
                 tracing::info!(
-                    "代理池健康检查完成：健康 {}，异常 {}，本轮自动禁用 {}，耗时 {:.1}s",
+                    "代理池健康检查完成：健康 {}，异常 {}，本轮自动禁用 {}，自愈恢复 {}，耗时 {:.1}s",
                     summary.healthy,
                     summary.unhealthy,
                     summary.auto_disabled,
+                    summary.self_healed,
                     started.elapsed().as_secs_f32()
                 );
                 tokio::time::sleep(interval).await;
@@ -2563,6 +2564,7 @@ impl AdminService {
             healthy: summary.healthy,
             unhealthy: summary.unhealthy,
             auto_disabled: summary.auto_disabled,
+            self_healed: summary.self_healed,
         }
     }
 
@@ -2592,17 +2594,16 @@ impl AdminService {
                 .collect(),
         };
 
-        let mut assigned = 0;
+        let mut assignments: Vec<(u64, Option<String>)> = Vec::with_capacity(target_ids.len());
         for (i, cred_id) in target_ids.iter().enumerate() {
             let url = urls[i % urls.len()].clone();
-            if self
-                .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None)
-                .is_ok()
-            {
-                assigned += 1;
-            }
+            assignments.push((*cred_id, Some(url)));
         }
+
+        let assigned = self
+            .token_manager
+            .update_credentials_proxy_batch(&assignments)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(AssignRoundRobinResponse {
             assigned,

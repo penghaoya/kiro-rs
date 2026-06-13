@@ -106,8 +106,9 @@ export function ProxyBatchImportDialog({
         setChecking(true)
         try {
           const checkRes = await checkAllProxies()
+          const healed = checkRes.selfHealed > 0 ? `，自愈恢复 ${checkRes.selfHealed}` : ''
           toast.success(
-            `健康检查完成：健康 ${checkRes.healthy}，异常 ${checkRes.unhealthy}，自动禁用 ${checkRes.autoDisabled}`
+            `健康检查完成：健康 ${checkRes.healthy}，异常 ${checkRes.unhealthy}，自动禁用 ${checkRes.autoDisabled}${healed}`
           )
           queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
         } catch (err) {
@@ -170,30 +171,31 @@ USER318898-zone-GB-session-456:9038b6:us.rrp.bestgo.work:10000`
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
                   <div className="text-sm font-medium">默认协议</div>
-                  <div className="flex flex-wrap gap-2">
+                  <div className="grid grid-cols-3 gap-1.5">
                     {SCHEME_OPTIONS.map((opt) => (
                       <button
                         key={opt.value}
                         type="button"
                         onClick={() => updateScheme(opt.value)}
-                        className={`rounded-lg border px-3 py-2 text-left text-xs transition-colors ${
+                        className={`rounded-lg border px-2 py-2 text-center text-xs font-medium transition-colors ${
                           defaultScheme === opt.value
                             ? 'border-primary bg-primary/10 text-primary'
-                            : 'border-border/60 hover:border-border hover:bg-muted/40'
+                            : 'border-border/60 text-foreground/80 hover:border-border hover:bg-muted/40'
                         }`}
                       >
-                        <div className="font-medium">{opt.label}</div>
-                        {opt.hint && (
-                          <div className="text-[10px] text-muted-foreground mt-0.5">{opt.hint}</div>
-                        )}
+                        {opt.label}
                       </button>
                     ))}
                   </div>
+                  <p className="text-[11px] text-muted-foreground leading-relaxed min-h-[1.25rem]">
+                    {SCHEME_OPTIONS.find((o) => o.value === defaultScheme)?.hint ??
+                      '用于无协议简写行；完整 URL 会忽略此设置。'}
+                  </p>
                 </div>
 
                 <div className="space-y-2">
                   <div className="text-sm font-medium">导入选项</div>
-                  <label className="flex items-center gap-2 rounded-lg border border-border/60 px-3 py-2.5 cursor-pointer hover:bg-muted/30">
+                  <label className="flex items-center gap-2.5 rounded-lg border border-border/60 px-3 py-2.5 cursor-pointer transition-colors hover:bg-muted/30">
                     <Checkbox
                       checked={autoCheck}
                       onCheckedChange={(v) => {
@@ -205,8 +207,8 @@ USER318898-zone-GB-session-456:9038b6:us.rrp.bestgo.work:10000`
                     <div className="text-sm">导入完成后自动健康检测</div>
                   </label>
                   <p className="text-[11px] text-muted-foreground leading-relaxed">
-                    完整 URL（含 <code className="text-[10px]">socks5h://</code> 等）会忽略格式设置；
-                    已存的 <code className="text-[10px]">socks5://</code> 探测时自动按 SOCKS5H 连接。
+                    完整 URL（含 <code className="rounded bg-muted px-1 text-[10px]">socks5h://</code> 等）会忽略格式设置；
+                    已存的 <code className="rounded bg-muted px-1 text-[10px]">socks5://</code> 探测时自动按 SOCKS5H 连接。
                   </p>
                 </div>
               </div>
@@ -225,16 +227,16 @@ USER318898-zone-GB-session-456:9038b6:us.rrp.bestgo.work:10000`
                       key={opt.value}
                       type="button"
                       onClick={() => updateFormat(opt.value)}
-                      className={`rounded-xl border px-3 py-2.5 text-left transition-colors ${
+                      className={`rounded-xl border px-3 py-2.5 text-left transition-all duration-150 ease-apple ${
                         importFormat === opt.value
-                          ? 'border-primary bg-primary/5 ring-1 ring-primary/20'
+                          ? 'border-primary bg-primary/5 ring-1 ring-primary/30'
                           : 'border-border/60 hover:border-border hover:bg-muted/30'
                       }`}
                     >
                       <div className="flex items-center gap-2">
                         <span className="text-sm font-medium">{opt.label}</span>
                         {opt.recommended && (
-                          <Badge variant="secondary" className="h-4 px-1 text-[9px]">
+                          <Badge variant="secondary" className="h-4 px-1.5 text-[9px]">
                             常用
                           </Badge>
                         )}

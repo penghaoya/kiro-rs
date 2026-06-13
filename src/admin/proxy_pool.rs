@@ -9,6 +9,7 @@ use crate::admin::types::ProxyEgressInfo;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use crate::proxy_url::{normalize_proxy_url, validate_proxy_url as validate_normalized_url};
+use futures::{StreamExt, stream};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -23,6 +24,10 @@ const PROXY_EGRESS_INFO_URL: &str = "https://my.ippure.com/v1/info";
 const PROXY_PROBE_TIMEOUT_SECS: u64 = 15;
 /// 连续探测失败阈值：达到后自动禁用（与凭据的 MAX_FAILURES_PER_CREDENTIAL 对齐）
 const MAX_PROXY_PROBE_FAILURES: u32 = 3;
+/// 全量健康检查的最大并发探测数（避免大池子一次性打开过多连接、触发 fd 上限或被限流）
+const MAX_CONCURRENT_PROBES: usize = 20;
+/// 自动禁用的代理在冷却这么久后，允许健康检查重新探测一次（探测成功即自愈恢复启用）
+const AUTO_DISABLED_RETRY_COOLDOWN_SECS: i64 = 30 * 60;
 
 /// 代理健康状态
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +95,8 @@ pub struct CheckSummary {
     pub unhealthy: usize,
     /// 本轮新增的自动禁用数
     pub auto_disabled: usize,
+    /// 本轮自愈（冷却后重探成功、自动恢复启用）数
+    pub self_healed: usize,
 }
 
 /// 单个代理探测结果
@@ -382,10 +389,10 @@ impl ProxyPoolManager {
         }
     }
 
-    /// 将一次探测结果回写到指定条目，并按需触发自动禁用。
+    /// 将一次探测结果回写到指定条目，并按需触发自动禁用 / 自愈恢复。
     ///
-    /// 返回 `(变为不健康, 本次新自动禁用)` 供摘要统计。
-    fn apply_probe_result(entry: &mut ProxyEntry, result: &ProbeResult) -> (bool, bool) {
+    /// 返回 `(变为不健康, 本次新自动禁用, 本次自愈恢复)` 供摘要统计。
+    fn apply_probe_result(entry: &mut ProxyEntry, result: &ProbeResult) -> (bool, bool, bool) {
         entry.last_checked_at = Some(chrono::Utc::now().to_rfc3339());
         match result {
             ProbeResult::Ok {
@@ -396,7 +403,16 @@ impl ProxyPoolManager {
                 entry.latency_ms = Some(*latency_ms);
                 entry.consecutive_failures = 0;
                 entry.egress = egress.clone();
-                (false, false)
+                // 自愈：此前被健康检查自动禁用的代理，重探成功后自动恢复启用。
+                // 用户手动禁用（auto_disabled == false）的不在此恢复，尊重用户意图。
+                let mut self_healed = false;
+                if entry.auto_disabled {
+                    entry.enabled = true;
+                    entry.auto_disabled = false;
+                    self_healed = true;
+                    tracing::info!("代理 #{} 重探成功，已自动恢复启用", entry.id);
+                }
+                (false, false, self_healed)
             }
             ProbeResult::Err { error } => {
                 entry.health = ProxyHealth::Unhealthy;
@@ -421,21 +437,28 @@ impl ProxyPoolManager {
                         entry.consecutive_failures
                     );
                 }
-                (true, newly_disabled)
+                (true, newly_disabled, false)
             }
         }
     }
 
-    /// 全量健康检查：并发探测所有「已启用」代理，回写结果并持久化一次。
+    /// 全量健康检查：并发探测「已启用」代理 + 冷却期满的自动禁用代理，回写并持久化一次。
     ///
-    /// 仅探测当前 enabled 的条目；用户/自动禁用的条目跳过（手动重新启用会清零计数）。
+    /// 探测目标：
+    /// - 所有 `enabled` 条目；
+    /// - 以及 `auto_disabled` 且距上次探测已超过 `AUTO_DISABLED_RETRY_COOLDOWN_SECS`
+    ///   的条目（给被自动禁用的代理一次重探自愈机会，成功即恢复启用）。
+    ///
+    /// 用户手动禁用（`enabled == false` 且 `auto_disabled == false`）的条目始终跳过。
+    /// 并发度由 `MAX_CONCURRENT_PROBES` 限流，避免大池子一次性打开过多连接。
     pub async fn check_all(&self) -> CheckSummary {
         // 快照待探测的 (id, url)，避免长时间持锁
+        let now = chrono::Utc::now();
         let targets: Vec<(u64, String)> = self
             .entries
             .lock()
             .iter()
-            .filter(|e| e.enabled)
+            .filter(|e| e.enabled || Self::auto_disabled_cooldown_elapsed(e, now))
             .map(|e| (e.id, e.url.clone()))
             .collect();
 
@@ -443,17 +466,20 @@ impl ProxyPoolManager {
             return CheckSummary::default();
         }
 
-        let probes = targets
-            .iter()
-            .map(|(id, url)| async move { (*id, self.probe_one(url).await) });
-        let results = futures::future::join_all(probes).await;
+        // 限流并发：最多 MAX_CONCURRENT_PROBES 个探测同时在飞
+        let results: Vec<(u64, ProbeResult)> = stream::iter(targets)
+            .map(|(id, url)| async move { (id, self.probe_one(&url).await) })
+            .buffer_unordered(MAX_CONCURRENT_PROBES)
+            .collect()
+            .await;
 
         let mut summary = CheckSummary::default();
         {
             let mut entries = self.entries.lock();
             for (id, result) in &results {
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
-                    let (unhealthy, newly_disabled) = Self::apply_probe_result(entry, result);
+                    let (unhealthy, newly_disabled, self_healed) =
+                        Self::apply_probe_result(entry, result);
                     if unhealthy {
                         summary.unhealthy += 1;
                     } else {
@@ -461,6 +487,9 @@ impl ProxyPoolManager {
                     }
                     if newly_disabled {
                         summary.auto_disabled += 1;
+                    }
+                    if self_healed {
+                        summary.self_healed += 1;
                     }
                 }
             }
@@ -470,6 +499,26 @@ impl ProxyPoolManager {
             tracing::warn!("健康检查后持久化失败: {}", e);
         }
         summary
+    }
+
+    /// 判断一个自动禁用的条目是否已过重探冷却期（可被纳入下一轮健康检查）。
+    ///
+    /// 仅对 `auto_disabled` 条目生效；从未探测过（无 `last_checked_at`）的视为已过冷却。
+    fn auto_disabled_cooldown_elapsed(entry: &ProxyEntry, now: chrono::DateTime<chrono::Utc>) -> bool {
+        if !entry.auto_disabled {
+            return false;
+        }
+        match entry
+            .last_checked_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        {
+            Some(last) => {
+                (now - last.with_timezone(&chrono::Utc)).num_seconds()
+                    >= AUTO_DISABLED_RETRY_COOLDOWN_SECS
+            }
+            None => true,
+        }
     }
 
     /// 单个代理即时探测（供 UI「测试」按钮调用），回写结果并持久化。
@@ -561,15 +610,16 @@ mod tests {
         };
         // 前两次失败：计数累加，仍启用
         for n in 1..MAX_PROXY_PROBE_FAILURES {
-            let (unhealthy, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &err);
+            let (unhealthy, disabled, healed) = ProxyPoolManager::apply_probe_result(&mut entry, &err);
             assert!(unhealthy);
             assert!(!disabled);
+            assert!(!healed);
             assert_eq!(entry.consecutive_failures, n);
             assert!(entry.enabled);
             assert!(!entry.auto_disabled);
         }
         // 第 N 次失败：自动禁用
-        let (_, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &err);
+        let (_, disabled, _) = ProxyPoolManager::apply_probe_result(&mut entry, &err);
         assert!(disabled);
         assert_eq!(entry.consecutive_failures, MAX_PROXY_PROBE_FAILURES);
         assert!(!entry.enabled);
@@ -585,12 +635,67 @@ mod tests {
             latency_ms: 123,
             egress: None,
         };
-        let (unhealthy, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &ok);
+        let (unhealthy, disabled, healed) = ProxyPoolManager::apply_probe_result(&mut entry, &ok);
         assert!(!unhealthy);
         assert!(!disabled);
+        assert!(!healed);
         assert_eq!(entry.consecutive_failures, 0);
         assert_eq!(entry.health, ProxyHealth::Healthy);
         assert_eq!(entry.latency_ms, Some(123));
+    }
+
+    #[test]
+    fn probe_success_self_heals_auto_disabled_entry() {
+        // 自动禁用的代理重探成功后应自动恢复启用并清除 auto_disabled
+        let mut entry = make_entry("socks5://127.0.0.1:1080");
+        entry.enabled = false;
+        entry.auto_disabled = true;
+        entry.consecutive_failures = MAX_PROXY_PROBE_FAILURES;
+        let ok = ProbeResult::Ok {
+            latency_ms: 50,
+            egress: None,
+        };
+        let (unhealthy, disabled, healed) = ProxyPoolManager::apply_probe_result(&mut entry, &ok);
+        assert!(!unhealthy);
+        assert!(!disabled);
+        assert!(healed);
+        assert!(entry.enabled);
+        assert!(!entry.auto_disabled);
+        assert_eq!(entry.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn cooldown_elapsed_only_for_auto_disabled_past_window() {
+        let now = chrono::Utc::now();
+        // 用户手动禁用（非 auto_disabled）：永不纳入重探
+        let mut manual = make_entry("socks5://127.0.0.1:1080");
+        manual.enabled = false;
+        manual.auto_disabled = false;
+        manual.last_checked_at = Some((now - chrono::Duration::hours(2)).to_rfc3339());
+        assert!(!ProxyPoolManager::auto_disabled_cooldown_elapsed(&manual, now));
+
+        // 自动禁用但刚探测过：仍在冷却期内
+        let mut fresh = make_entry("socks5://127.0.0.1:1080");
+        fresh.enabled = false;
+        fresh.auto_disabled = true;
+        fresh.last_checked_at = Some((now - chrono::Duration::seconds(60)).to_rfc3339());
+        assert!(!ProxyPoolManager::auto_disabled_cooldown_elapsed(&fresh, now));
+
+        // 自动禁用且已过冷却：纳入重探
+        let mut stale = make_entry("socks5://127.0.0.1:1080");
+        stale.enabled = false;
+        stale.auto_disabled = true;
+        stale.last_checked_at = Some(
+            (now - chrono::Duration::seconds(AUTO_DISABLED_RETRY_COOLDOWN_SECS + 1)).to_rfc3339(),
+        );
+        assert!(ProxyPoolManager::auto_disabled_cooldown_elapsed(&stale, now));
+
+        // 自动禁用但从未探测过：视为已过冷却
+        let mut never = make_entry("socks5://127.0.0.1:1080");
+        never.enabled = false;
+        never.auto_disabled = true;
+        never.last_checked_at = None;
+        assert!(ProxyPoolManager::auto_disabled_cooldown_elapsed(&never, now));
     }
 
     #[test]

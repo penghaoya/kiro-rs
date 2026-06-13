@@ -2968,6 +2968,33 @@ impl MultiTokenManager {
         Ok(())
     }
 
+    /// 批量设置多个凭据的 `proxy_url`，在单次加锁内改完所有条目，最后只持久化一次。
+    ///
+    /// 相比循环调用 [`update_credential`]（每次都全量写盘），这里对 N 个凭据只写一次盘，
+    /// 用于轮询分配等批量场景。返回实际命中的凭据数（不存在的 id 会被静默跳过）。
+    ///
+    /// `assignments` 的每项为 `(credential_id, proxy_url)`：`None` 表示清除该凭据的代理。
+    pub fn update_credentials_proxy_batch(
+        &self,
+        assignments: &[(u64, Option<String>)],
+    ) -> anyhow::Result<usize> {
+        let mut updated = 0;
+        {
+            let mut entries = self.entries.lock();
+            for (id, proxy_url) in assignments {
+                if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
+                    entry.credentials.proxy_url =
+                        proxy_url.clone().filter(|s| !s.is_empty());
+                    updated += 1;
+                }
+            }
+        }
+        if updated > 0 {
+            self.persist_credentials()?;
+        }
+        Ok(updated)
+    }
+
     /// 更新重新登录过程中获得的认证元数据。
     pub fn update_auth_metadata(&self, id: u64, metadata: KiroCredentials) -> anyhow::Result<()> {
         let mut changed = false;
