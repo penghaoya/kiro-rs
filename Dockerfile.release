@@ -19,3 +19,4 @@ VOLUME ["/app/config"]
 EXPOSE 8990
 
 CMD ["./kiro-rs", "--data-dir", "/app/config"]
+

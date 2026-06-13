@@ -34,3 +34,5 @@
 .codegraph/
 .claude/
 tmp
+# macOS 目录元数据
+.DS_Store
