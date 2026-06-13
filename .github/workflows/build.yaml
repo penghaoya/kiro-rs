@@ -5,10 +5,14 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+  workflow_dispatch:
 
 concurrency:
   group: build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,44 +20,138 @@ env:
   RUST_TOOLCHAIN: "1.92"
 
 jobs:
-  build:
-    name: Frontend + Rust (linux x64)
+  build-frontend:
+    name: Admin UI
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
 
-      - name: Cache Bun
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
           key: bun-${{ runner.os }}-${{ hashFiles('admin-ui/bun.lock') }}
           restore-keys: |
             bun-${{ runner.os }}-
 
-      - name: Build Admin UI
+      - name: bun run build
         working-directory: admin-ui
         run: |
           bun install --frozen-lockfile --ignore-scripts
           bun run build
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@master
+      - uses: actions/upload-artifact@v4
+        with:
+          name: admin-ui-dist
+          path: admin-ui/dist
+          if-no-files-found: error
+
+  test:
+    name: Test (linux x64)
+    needs: build-frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: admin-ui-dist
+          path: admin-ui/dist
+
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-unknown-linux-musl
 
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release
+          shared-key: test-x86_64-unknown-linux-musl
 
-      - name: cargo build
-        run: cargo build --release --locked --no-default-features
+      - run: cargo build --release --locked --no-default-features --target x86_64-unknown-linux-musl
+      - run: cargo test --locked --no-default-features
 
-      - name: cargo test
-        run: cargo test --locked --no-default-features
+  build-binaries:
+    name: ${{ matrix.suffix }}
+    needs: build-frontend
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            suffix: Linux-musl-x64
+            bin: kiro-rs
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            suffix: Linux-musl-arm64
+            bin: kiro-rs
+          - os: macos-14
+            target: x86_64-apple-darwin
+            suffix: macOS-x64
+            bin: kiro-rs
+          - os: macos-14
+            target: aarch64-apple-darwin
+            suffix: macOS-arm64
+            bin: kiro-rs
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: Windows-x64
+            bin: kiro-rs.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: admin-ui-dist
+          path: admin-ui/dist
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Install musl (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - run: cargo build --release --locked --no-default-features --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="kiro-rs-${{ matrix.suffix }}"
+          BIN="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          install -m 755 "$BIN" "./${{ matrix.bin }}"
+          tar -czf "${OUT}.tar.gz" "./${{ matrix.bin }}"
+          mkdir -p release
+          mv "${OUT}.tar.gz" release/
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "kiro-rs-${{ matrix.suffix }}"
+          $bin = "target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path $bin -DestinationPath "release/$out.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.suffix }}
+          path: release/
+          retention-days: 30
+          if-no-files-found: error
