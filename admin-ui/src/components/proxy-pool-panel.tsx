@@ -12,15 +12,16 @@ import {
   CheckCircle2,
   XCircle,
   HelpCircle,
+  Settings2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import { Card, CardContent } from '@/components/ui/card'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   getProxyPool,
   addProxy,
-  batchAddProxies,
   deleteProxy,
   setProxyEnabled,
   getGlobalProxy,
@@ -30,32 +31,91 @@ import {
   assignProxiesRoundRobin,
 } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
-import type { ProxyPoolEntry } from '@/types/api'
+import {
+  loadDefaultScheme,
+  loadImportFormat,
+  SCHEME_OPTIONS,
+} from '@/lib/proxy-import'
+import { ProxyBatchImportDialog } from '@/components/proxy-batch-import-dialog'
+import type { ProxyImportFormat, ProxyPoolEntry, ProxyEgressInfo, ProxyScheme } from '@/types/api'
 
-export type ProxyScheme = 'http' | 'https' | 'socks5' | 'socks4'
+function formatEgressSummary(egress: ProxyEgressInfo): string {
+  const loc = [egress.city, egress.region, egress.countryCode || egress.country]
+    .filter(Boolean)
+    .join(', ')
+  const parts = [egress.ip, loc].filter(Boolean)
+  if (egress.fraudScore != null) parts.push(`风险 ${egress.fraudScore}`)
+  if (egress.isResidential === true) parts.push('住宅')
+  else if (egress.isResidential === false) parts.push('非住宅')
+  if (egress.isBroadcast === true) parts.push('机房')
+  if (egress.asOrganization) parts.push(egress.asOrganization)
+  return parts.join(' · ')
+}
 
-const SCHEME_OPTIONS: { value: ProxyScheme; label: string }[] = [
-  { value: 'http', label: 'HTTP' },
-  { value: 'https', label: 'HTTPS' },
-  { value: 'socks5', label: 'SOCKS5' },
-  { value: 'socks4', label: 'SOCKS4' },
-]
+function EgressBadges({ egress }: { egress: ProxyEgressInfo }) {
+  return (
+    <div className="flex flex-wrap items-center gap-1 mt-1">
+      <span className="text-xs text-foreground/90 font-mono">{egress.ip}</span>
+      {(egress.city || egress.countryCode) && (
+        <Badge variant="outline" className="h-5 px-1.5 text-[10px] font-normal">
+          {[egress.city, egress.countryCode].filter(Boolean).join(', ')}
+        </Badge>
+      )}
+      {egress.fraudScore != null && (
+        <Badge
+          variant="outline"
+          className={`h-5 px-1.5 text-[10px] font-normal ${
+            egress.fraudScore >= 70
+              ? 'border-destructive/40 text-destructive'
+              : egress.fraudScore >= 40
+                ? 'border-amber-500/40 text-amber-600 dark:text-amber-400'
+                : 'border-green-500/40 text-green-600 dark:text-green-400'
+          }`}
+        >
+          风险 {egress.fraudScore}
+        </Badge>
+      )}
+      {egress.isResidential === true && (
+        <Badge variant="outline" className="h-5 px-1.5 text-[10px] font-normal border-green-500/40 text-green-600 dark:text-green-400">
+          住宅
+        </Badge>
+      )}
+      {egress.isResidential === false && (
+        <Badge variant="outline" className="h-5 px-1.5 text-[10px] font-normal">
+          非住宅
+        </Badge>
+      )}
+      {egress.isBroadcast === true && (
+        <Badge variant="outline" className="h-5 px-1.5 text-[10px] font-normal border-amber-500/40 text-amber-600 dark:text-amber-400">
+          机房
+        </Badge>
+      )}
+      {egress.asOrganization && (
+        <span className="text-[10px] text-muted-foreground truncate max-w-[180px]" title={egress.asOrganization}>
+          {egress.asOrganization}
+        </span>
+      )}
+    </div>
+  )
+}
 
 interface ProxyPoolPanelProps {
-  /** Dialog 模式下仅在打开时拉取；页面模式始终为 true */
   enabled?: boolean
-  /** 凭据编辑里「选用」代理 */
   onSelectProxy?: (url: string) => void
 }
 
 export function ProxyPoolPanel({ enabled = true, onSelectProxy }: ProxyPoolPanelProps) {
   const [newUrl, setNewUrl] = useState('')
   const [newLabel, setNewLabel] = useState('')
-  const [defaultScheme, setDefaultScheme] = useState<ProxyScheme>('http')
-  const [batchText, setBatchText] = useState('')
-  const [showBatch, setShowBatch] = useState(false)
-  const [batchErrors, setBatchErrors] = useState<string[]>([])
+  const [batchOpen, setBatchOpen] = useState(false)
+  const [importPrefs, setImportPrefs] = useState(() => ({
+    scheme: loadDefaultScheme(),
+    format: loadImportFormat(),
+  }))
   const queryClient = useQueryClient()
+
+  const schemeLabel =
+    SCHEME_OPTIONS.find((o) => o.value === importPrefs.scheme)?.label ?? importPrefs.scheme
 
   const { data, isLoading } = useQuery({
     queryKey: ['proxy-pool'],
@@ -85,7 +145,8 @@ export function ProxyPoolPanel({ enabled = true, onSelectProxy }: ProxyPoolPanel
       addProxy({
         url: newUrl.trim(),
         label: newLabel.trim() || undefined,
-        defaultScheme,
+        defaultScheme: importPrefs.scheme,
+        importFormat: importPrefs.format,
       }),
     onSuccess: (entry) => {
       toast.success(`代理已添加：${maskProxyUrl(entry.url)}`)
@@ -96,39 +157,16 @@ export function ProxyPoolPanel({ enabled = true, onSelectProxy }: ProxyPoolPanel
     onError: (err) => toast.error(`添加失败: ${extractErrorMessage(err)}`),
   })
 
-  const batchMutation = useMutation({
-    mutationFn: () =>
-      batchAddProxies({
-        urls: batchText.split('\n').map((l) => l.trim()).filter(Boolean),
-        defaultScheme,
-      }),
-    onSuccess: (res) => {
-      if (res.errors === 0) {
-        toast.success(`批量导入完成：成功 ${res.added} 个`)
-      } else {
-        toast.info(`批量导入完成：成功 ${res.added} 个，跳过 ${res.errors} 个`)
-      }
-      setBatchErrors(res.errorMessages)
-      setBatchText('')
-      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
-    },
-    onError: (err) => toast.error(`批量导入失败: ${extractErrorMessage(err)}`),
-  })
-
   const deleteMutation = useMutation({
     mutationFn: (id: number) => deleteProxy(id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
-    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['proxy-pool'] }),
     onError: (err) => toast.error(`删除失败: ${extractErrorMessage(err)}`),
   })
 
   const toggleMutation = useMutation({
     mutationFn: ({ id, enabled: en }: { id: number; enabled: boolean }) =>
       setProxyEnabled(id, en),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['proxy-pool'] })
-    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['proxy-pool'] }),
     onError: (err) => toast.error(`操作失败: ${extractErrorMessage(err)}`),
   })
 
@@ -138,7 +176,8 @@ export function ProxyPoolPanel({ enabled = true, onSelectProxy }: ProxyPoolPanel
     onMutate: (id) => setCheckingId(id),
     onSuccess: (res) => {
       if (res.health === 'healthy') {
-        toast.success(`代理可用，延迟 ${res.latencyMs ?? '-'} ms`)
+        const egressHint = res.egress ? ` · ${formatEgressSummary(res.egress)}` : ''
+        toast.success(`代理可用，延迟 ${res.latencyMs ?? '-'} ms${egressHint}`)
       } else {
         toast.error(res.autoDisabled ? '代理探测失败，已自动禁用' : '代理探测失败')
       }
@@ -200,168 +239,145 @@ export function ProxyPoolPanel({ enabled = true, onSelectProxy }: ProxyPoolPanel
     )
   }
 
-  const schemeSelect = (
-    <select
-      value={defaultScheme}
-      onChange={(e) => setDefaultScheme(e.target.value as ProxyScheme)}
-      className="h-9 rounded-md border border-input bg-background px-2 text-xs"
-      title="无协议简写时使用的默认协议"
-    >
-      {SCHEME_OPTIONS.map((opt) => (
-        <option key={opt.value} value={opt.value}>
-          {opt.label}
-        </option>
-      ))}
-    </select>
-  )
+  const total = data?.total ?? 0
+  const healthyCount = data?.proxies.filter((p) => p.health === 'healthy').length ?? 0
 
   return (
     <div className="space-y-4">
-      <div className="rounded-lg border border-border/60 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
-        支持完整 URL（如 <code className="text-xs">socks5://user:pass@host:port</code>）或无协议简写：
-        <code className="text-xs">user:pass:host:port</code>、
-        <code className="text-xs">host:port</code>、
-        <code className="text-xs">user:pass@host:port</code>。
-        简写格式通过下方「默认协议」补全 scheme。
-      </div>
-
-      {!showBatch && (
-        <form onSubmit={handleAdd} className="flex flex-wrap gap-2">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <form onSubmit={handleAdd} className="flex flex-1 flex-wrap gap-2 min-w-0">
           <Input
-            placeholder="代理地址（可不带协议）"
+            placeholder="单条添加：完整 URL 或无协议简写"
             value={newUrl}
             onChange={(e) => setNewUrl(e.target.value)}
-            className="flex-1 min-w-[220px] font-mono text-sm"
+            className="flex-1 min-w-[200px] font-mono text-sm"
           />
           <Input
-            placeholder="备注（可选）"
+            placeholder="备注"
             value={newLabel}
             onChange={(e) => setNewLabel(e.target.value)}
-            className="w-32"
+            className="w-24 sm:w-28"
           />
-          {schemeSelect}
           <Button type="submit" size="sm" disabled={addMutation.isPending || !newUrl.trim()}>
-            <Plus className="h-4 w-4 mr-1" />
-            添加
-          </Button>
-          <Button type="button" size="sm" variant="outline" onClick={() => setShowBatch(true)}>
-            <Upload className="h-4 w-4 mr-1" />
-            批量
+            <Plus className="h-4 w-4 sm:mr-1" />
+            <span className="hidden sm:inline">添加</span>
           </Button>
         </form>
-      )}
+        <div className="flex items-center gap-2 shrink-0">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => setBatchOpen(true)}
+          >
+            <Upload className="h-4 w-4 mr-1" />
+            批量导入
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="text-xs text-muted-foreground"
+            onClick={() => setBatchOpen(true)}
+            title="简写导入时使用：协议与行格式"
+          >
+            <Settings2 className="h-3.5 w-3.5 mr-1" />
+            {schemeLabel}
+          </Button>
+        </div>
+      </div>
 
-      {showBatch && (
-        <div className="space-y-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <label className="text-sm font-medium">
-              批量导入（每行一个，# 开头为注释）
-            </label>
-            <span className="text-xs text-muted-foreground">默认协议</span>
-            {schemeSelect}
-          </div>
-          <textarea
-            placeholder={'# 每行一个，无需写协议\nUSERxxx-zone-GB-session-123:password:host.example.com:10000\nhost2.example.com:8080'}
-            value={batchText}
-            onChange={(e) => setBatchText(e.target.value)}
-            className="flex min-h-[140px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          />
-          <div className="flex gap-2">
+      <p className="text-xs text-muted-foreground -mt-1">
+        无协议简写沿用批量导入中的协议与格式设置；完整 URL 可直接粘贴添加。
+      </p>
+
+      <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
+        <Card className="shadow-none">
+          <CardContent className="p-3 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 min-w-0">
+              <Globe className="h-4 w-4 text-muted-foreground shrink-0" />
+              <div className="min-w-0">
+                <div className="text-sm font-medium">全局代理</div>
+                <div className="text-xs font-mono text-muted-foreground truncate">
+                  {currentGlobalProxy ? maskProxyUrl(currentGlobalProxy) : '未配置（直连）'}
+                </div>
+              </div>
+            </div>
+            {currentGlobalProxy && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 text-xs text-destructive hover:text-destructive shrink-0"
+                onClick={() => setGlobalProxyMutation.mutate(null)}
+                disabled={setGlobalProxyMutation.isPending}
+              >
+                清除
+              </Button>
+            )}
+          </CardContent>
+        </Card>
+
+        {total > 0 && (
+          <div className="flex items-center gap-1 sm:justify-end">
             <Button
               size="sm"
-              onClick={() => batchMutation.mutate()}
-              disabled={batchMutation.isPending || !batchText.trim()}
+              variant="outline"
+              className="h-9 text-xs"
+              onClick={() => checkAllMutation.mutate()}
+              disabled={checkAllMutation.isPending}
             >
-              导入
+              <Activity className="h-3 w-3 mr-1" />
+              {checkAllMutation.isPending ? '检测中…' : '全部检测'}
             </Button>
             <Button
               size="sm"
               variant="outline"
-              onClick={() => {
-                setShowBatch(false)
-                setBatchText('')
-                setBatchErrors([])
-              }}
+              className="h-9 text-xs"
+              onClick={() => assignRoundRobinMutation.mutate()}
+              disabled={assignRoundRobinMutation.isPending}
             >
-              {batchMutation.isSuccess ? '关闭' : '取消'}
+              <Shuffle className="h-3 w-3 mr-1" />
+              轮询分配
             </Button>
           </div>
-          {batchErrors.length > 0 && (
-            <div className="text-xs text-muted-foreground space-y-1 max-h-24 overflow-y-auto border rounded-md p-2">
-              <div className="font-medium text-yellow-600 dark:text-yellow-400">跳过的条目：</div>
-              {batchErrors.map((msg, i) => (
-                <div key={i}>{msg}</div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+        )}
+      </div>
 
-      <div className="rounded-md border p-3 space-y-2">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Globe className="h-4 w-4 text-muted-foreground" />
-            <span className="text-sm font-medium">全局代理</span>
-          </div>
-          {currentGlobalProxy && (
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-6 text-xs text-destructive hover:text-destructive"
-              onClick={() => setGlobalProxyMutation.mutate(null)}
-              disabled={setGlobalProxyMutation.isPending}
-            >
-              清除
-            </Button>
+      <div className="flex items-center justify-between text-sm">
+        <div className="text-muted-foreground">
+          共 {total} 个
+          {total > 0 && (
+            <span className="ml-2 text-green-600 dark:text-green-400">
+              健康 {healthyCount}
+            </span>
           )}
-        </div>
-        <div className="text-xs font-mono text-muted-foreground">
-          {currentGlobalProxy ? maskProxyUrl(currentGlobalProxy) : '未配置（直连）'}
         </div>
       </div>
 
-      <div className="space-y-1">
-        <div className="flex items-center justify-between">
-          <div className="text-sm text-muted-foreground">共 {data?.total ?? 0} 个代理</div>
-          {(data?.total ?? 0) > 0 && (
-            <div className="flex items-center gap-1">
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 text-xs"
-                onClick={() => checkAllMutation.mutate()}
-                disabled={checkAllMutation.isPending}
-              >
-                <Activity className="h-3 w-3 mr-1" />
-                {checkAllMutation.isPending ? '检测中...' : '全部检测'}
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 text-xs"
-                onClick={() => assignRoundRobinMutation.mutate()}
-                disabled={assignRoundRobinMutation.isPending}
-              >
-                <Shuffle className="h-3 w-3 mr-1" />
-                轮询分配
-              </Button>
-            </div>
-          )}
-        </div>
+      {isLoading && (
+        <div className="text-sm text-muted-foreground py-8 text-center">加载中…</div>
+      )}
 
-        {isLoading && (
-          <div className="text-sm text-muted-foreground py-4 text-center">加载中...</div>
-        )}
-
-        {data?.proxies.length === 0 && !isLoading && (
-          <div className="text-sm text-muted-foreground py-8 text-center border rounded-md">
-            暂无代理，请添加或批量导入
+      {!isLoading && total === 0 && (
+        <div className="rounded-2xl border border-dashed py-12 px-6 text-center space-y-3">
+          <Upload className="h-8 w-8 text-muted-foreground/50 mx-auto" />
+          <div>
+            <p className="text-sm font-medium">还没有代理</p>
+            <p className="text-xs text-muted-foreground mt-1">
+              推荐通过批量导入粘贴供应商提供的代理列表
+            </p>
           </div>
-        )}
+          <Button size="sm" onClick={() => setBatchOpen(true)}>
+            <Upload className="h-4 w-4 mr-1" />
+            打开批量导入
+          </Button>
+        </div>
+      )}
 
-        <div className="border rounded-md divide-y max-h-[480px] overflow-y-auto">
+      {total > 0 && (
+        <div className="border rounded-xl divide-y max-h-[480px] overflow-y-auto">
           {data?.proxies.map((proxy: ProxyPoolEntry) => (
-            <div key={proxy.id} className="flex items-center gap-3 p-3">
+            <div key={proxy.id} className="flex items-center gap-3 p-3 hover:bg-muted/20 transition-colors">
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="font-mono text-xs truncate">{maskProxyUrl(proxy.url)}</span>
@@ -377,7 +393,8 @@ export function ProxyPoolPanel({ enabled = true, onSelectProxy }: ProxyPoolPanel
                     </Badge>
                   )}
                 </div>
-                <div className="flex items-center gap-3 mt-0.5">
+                <div className="flex items-center gap-3 mt-0.5 flex-wrap">
+                  {proxy.egress && <EgressBadges egress={proxy.egress} />}
                   {proxy.credentialCount > 0 && (
                     <span className="text-xs text-muted-foreground">
                       {proxy.credentialCount} 个凭据使用中
@@ -453,7 +470,18 @@ export function ProxyPoolPanel({ enabled = true, onSelectProxy }: ProxyPoolPanel
             </div>
           ))}
         </div>
-      </div>
+      )}
+
+      <ProxyBatchImportDialog
+        open={batchOpen}
+        onOpenChange={setBatchOpen}
+        onPrefsChange={(prefs) =>
+          setImportPrefs(prefs as { scheme: ProxyScheme; format: ProxyImportFormat })
+        }
+      />
     </div>
   )
 }
+
+// 兼容旧引用
+export type { ProxyScheme } from '@/types/api'

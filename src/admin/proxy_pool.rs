@@ -5,6 +5,7 @@
 //! 除增删改查外，还提供主动健康检查：周期性（或按需）通过每个代理请求一个
 //! 轻量公网探测端点，记录连通性与延迟；连续探测失败达阈值的代理会被自动禁用。
 
+use crate::admin::types::ProxyEgressInfo;
 use crate::http_client::{ProxyConfig, build_client};
 use crate::model::config::TlsBackend;
 use crate::proxy_url::{normalize_proxy_url, validate_proxy_url as validate_normalized_url};
@@ -14,10 +15,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// 健康检查探测端点：返回 204 No Content 的轻量公网地址，不依赖上游 Kiro。
-const PROXY_HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
-/// 单次探测超时（秒）
-const PROXY_PROBE_TIMEOUT_SECS: u64 = 8;
+/// 健康检查连通性探测（HTTPS CONNECT，兼容 HTTP 代理）
+const PROXY_HEALTH_CHECK_URL: &str = "https://cp.cloudflare.com/generate_204";
+/// 出口 IP 信息（IPPure 公开 API，测试阶段可能有变动）
+const PROXY_EGRESS_INFO_URL: &str = "https://my.ippure.com/v1/info";
+/// 单次探测超时（秒）；住宅代理握手较慢，适当放宽
+const PROXY_PROBE_TIMEOUT_SECS: u64 = 15;
 /// 连续探测失败阈值：达到后自动禁用（与凭据的 MAX_FAILURES_PER_CREDENTIAL 对齐）
 const MAX_PROXY_PROBE_FAILURES: u32 = 3;
 
@@ -59,6 +62,9 @@ pub struct ProxyEntry {
     /// 是否由健康检查自动禁用（区别于用户手动禁用）
     #[serde(default)]
     pub auto_disabled: bool,
+    /// 最近一次成功探测的出口 IP 信息
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<ProxyEgressInfo>,
 }
 
 fn default_true() -> bool {
@@ -88,8 +94,13 @@ pub struct CheckSummary {
 
 /// 单个代理探测结果
 enum ProbeResult {
-    Ok { latency_ms: u32 },
-    Err { error: String },
+    Ok {
+        latency_ms: u32,
+        egress: Option<ProxyEgressInfo>,
+    },
+    Err {
+        error: String,
+    },
 }
 
 pub struct ProxyPoolManager {
@@ -128,8 +139,9 @@ impl ProxyPoolManager {
         url: String,
         label: Option<String>,
         default_scheme: Option<&str>,
+        import_format: crate::proxy_url::ProxyImportFormat,
     ) -> anyhow::Result<ProxyEntry> {
-        let url = normalize_proxy_url(&url, default_scheme)?;
+        let url = normalize_proxy_url(&url, default_scheme, import_format)?;
         if url.eq_ignore_ascii_case("direct") {
             anyhow::bail!("代理池不支持 direct，请填写真实代理地址");
         }
@@ -152,6 +164,7 @@ impl ProxyPoolManager {
             last_checked_at: None,
             consecutive_failures: 0,
             auto_disabled: false,
+            egress: None,
         };
         entries.push(entry.clone());
         drop(entries);
@@ -165,6 +178,7 @@ impl ProxyPoolManager {
         &self,
         urls: Vec<String>,
         default_scheme: Option<&str>,
+        import_format: crate::proxy_url::ProxyImportFormat,
     ) -> (Vec<ProxyEntry>, Vec<String>) {
         let mut added = vec![];
         let mut errors = vec![];
@@ -175,7 +189,7 @@ impl ProxyPoolManager {
             if url.is_empty() || url.starts_with('#') {
                 continue;
             }
-            let url = match normalize_proxy_url(url, default_scheme) {
+            let url = match normalize_proxy_url(url, default_scheme, import_format) {
                 Ok(u) => u,
                 Err(e) => {
                     errors.push(e.to_string());
@@ -205,6 +219,7 @@ impl ProxyPoolManager {
                 last_checked_at: None,
                 consecutive_failures: 0,
                 auto_disabled: false,
+                egress: None,
             };
             entries.push(entry.clone());
             added.push(entry);
@@ -286,12 +301,9 @@ impl ProxyPoolManager {
 // ============ 健康检查 ============
 
 impl ProxyPoolManager {
-    /// 探测单个代理 URL 的连通性与延迟。
-    ///
-    /// 通过该代理请求 `PROXY_HEALTH_CHECK_URL`，成功（HTTP 2xx/3xx）即视为连通，
-    /// 返回往返延迟；任何网络错误或非预期状态码视为失败。
+    /// 探测单个代理：先验证连通性，再查询 IPPure 出口信息。
     async fn probe_one(&self, url: &str) -> ProbeResult {
-        let proxy = ProxyConfig::new(url);
+        let proxy = ProxyConfig::from_url(url);
         let client = match build_client(Some(&proxy), PROXY_PROBE_TIMEOUT_SECS, self.tls_backend) {
             Ok(c) => c,
             Err(e) => {
@@ -301,23 +313,72 @@ impl ProxyPoolManager {
             }
         };
 
+        tracing::debug!(
+            "探测代理: {}",
+            crate::security::redact_proxy_url(url)
+        );
+
         let started = Instant::now();
+
+        // 优先 IPPure（HTTPS）：连通性 + 出口信息一次完成
+        if let Some(egress) = self.fetch_egress_info(&client).await {
+            return ProbeResult::Ok {
+                latency_ms: started.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                egress: Some(egress),
+            };
+        }
+
+        // 回退：HTTPS 204 探测连通性
         match client.get(PROXY_HEALTH_CHECK_URL).send().await {
             Ok(resp) => {
                 let status = resp.status();
-                if status.is_success() || status.is_redirection() {
+                if status.as_u16() == 204 || status.is_success() || status.is_redirection() {
                     ProbeResult::Ok {
                         latency_ms: started.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                        egress: None,
                     }
                 } else {
                     ProbeResult::Err {
-                        error: format!("探测端点返回非预期状态: {}", status),
+                        error: format!(
+                            "连通性探测 {} 返回非预期状态: {}",
+                            PROXY_HEALTH_CHECK_URL,
+                            status
+                        ),
                     }
                 }
             }
             Err(e) => ProbeResult::Err {
-                error: e.to_string(),
+                error: format!(
+                    "连通性探测 {} 失败: {}（请确认导入格式与协议类型）",
+                    PROXY_HEALTH_CHECK_URL,
+                    e
+                ),
             },
+        }
+    }
+
+    /// 通过 IPPure 查询代理出口 IP 信息；失败时不影响连通性判定。
+    async fn fetch_egress_info(&self, client: &reqwest::Client) -> Option<ProxyEgressInfo> {
+        match client.get(PROXY_EGRESS_INFO_URL).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<ProxyEgressInfo>().await {
+                Ok(info) if !info.ip.trim().is_empty() => Some(info),
+                Ok(_) => {
+                    tracing::warn!("IPPure 返回空 IP");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("IPPure 响应解析失败: {}", e);
+                    None
+                }
+            },
+            Ok(resp) => {
+                tracing::warn!("IPPure 返回非成功状态: {}", resp.status());
+                None
+            }
+            Err(e) => {
+                tracing::warn!("IPPure 查询失败: {}", e);
+                None
+            }
         }
     }
 
@@ -327,15 +388,20 @@ impl ProxyPoolManager {
     fn apply_probe_result(entry: &mut ProxyEntry, result: &ProbeResult) -> (bool, bool) {
         entry.last_checked_at = Some(chrono::Utc::now().to_rfc3339());
         match result {
-            ProbeResult::Ok { latency_ms } => {
+            ProbeResult::Ok {
+                latency_ms,
+                egress,
+            } => {
                 entry.health = ProxyHealth::Healthy;
                 entry.latency_ms = Some(*latency_ms);
                 entry.consecutive_failures = 0;
+                entry.egress = egress.clone();
                 (false, false)
             }
             ProbeResult::Err { error } => {
                 entry.health = ProxyHealth::Unhealthy;
                 entry.latency_ms = None;
+                entry.egress = None;
                 entry.consecutive_failures += 1;
                 tracing::warn!(
                     "代理 #{} 探测失败（{}/{}）: {}",
@@ -448,7 +514,30 @@ mod tests {
             last_checked_at: None,
             consecutive_failures: 0,
             auto_disabled: false,
+            egress: None,
         }
+    }
+
+    #[test]
+    fn ippure_egress_json_deserializes() {
+        let json = r#"{
+            "ip": "104.28.123.123",
+            "asn": 13335,
+            "asOrganization": "Cloudflare, Inc.",
+            "country": "United States",
+            "countryCode": "US",
+            "region": "California",
+            "city": "Los Angeles",
+            "fraudScore": 75,
+            "isResidential": false,
+            "isBroadcast": false
+        }"#;
+        let info: ProxyEgressInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.ip, "104.28.123.123");
+        assert_eq!(info.asn, Some(13335));
+        assert_eq!(info.country_code.as_deref(), Some("US"));
+        assert_eq!(info.fraud_score, Some(75));
+        assert_eq!(info.is_residential, Some(false));
     }
 
     #[test]
@@ -492,7 +581,10 @@ mod tests {
         let mut entry = make_entry("socks5://127.0.0.1:1080");
         entry.consecutive_failures = 2;
         entry.health = ProxyHealth::Unhealthy;
-        let ok = ProbeResult::Ok { latency_ms: 123 };
+        let ok = ProbeResult::Ok {
+            latency_ms: 123,
+            egress: None,
+        };
         let (unhealthy, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &ok);
         assert!(!unhealthy);
         assert!(!disabled);
@@ -505,7 +597,7 @@ mod tests {
     fn set_enabled_true_clears_auto_disable_state() {
         let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
         let entry = mgr
-            .add("socks5://127.0.0.1:1080".to_string(), None, None)
+            .add("socks5://127.0.0.1:1080".to_string(), None, None, Default::default())
             .unwrap();
         // 模拟自动禁用状态
         {

@@ -488,6 +488,35 @@ pub struct SetLogGovernanceConfigRequest {
 
 // ============ 代理池 ============
 
+/// 代理出口 IP 信息（IPPure API: https://my.ippure.com/v1/info）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyEgressInfo {
+    pub ip: String,
+    #[serde(default)]
+    pub asn: Option<u32>,
+    #[serde(default)]
+    pub as_organization: Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
+    #[serde(default)]
+    pub country_code: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub region_code: Option<String>,
+    #[serde(default)]
+    pub city: Option<String>,
+    #[serde(default)]
+    pub timezone: Option<String>,
+    #[serde(default)]
+    pub fraud_score: Option<u32>,
+    #[serde(default)]
+    pub is_residential: Option<bool>,
+    #[serde(default)]
+    pub is_broadcast: Option<bool>,
+}
+
 /// 代理池条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -515,6 +544,9 @@ pub struct ProxyPoolEntry {
     pub consecutive_failures: u32,
     /// 是否由健康检查自动禁用
     pub auto_disabled: bool,
+    /// 最近一次探测得到的出口 IP 信息（IPPure）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<ProxyEgressInfo>,
 }
 
 /// 代理池列表响应
@@ -537,6 +569,8 @@ pub struct ProxyCheckResponse {
     pub last_checked_at: Option<String>,
     pub enabled: bool,
     pub auto_disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress: Option<ProxyEgressInfo>,
 }
 
 /// 全量健康检查响应
@@ -577,6 +611,9 @@ pub struct AddProxyRequest {
     /// 无协议简写时的默认协议：http / https / socks5 / socks4
     #[serde(default)]
     pub default_scheme: Option<String>,
+    /// 导入格式：auto / user_pass_host_port / host_port_user_pass / user_pass_at_host_port / host_port_at_user_pass
+    #[serde(default)]
+    pub import_format: Option<String>,
 }
 
 /// 批量导入代理请求
@@ -588,6 +625,9 @@ pub struct BatchAddProxyRequest {
     /// 无协议简写时的默认协议：http / https / socks5 / socks4
     #[serde(default)]
     pub default_scheme: Option<String>,
+    /// 导入格式：auto / user_pass_host_port / host_port_user_pass / user_pass_at_host_port / host_port_at_user_pass
+    #[serde(default)]
+    pub import_format: Option<String>,
 }
 
 /// 分配代理给凭据请求

@@ -163,6 +163,22 @@ export interface UpdateRefreshTokenRequest {
 // 代理健康状态
 export type ProxyHealth = 'unknown' | 'healthy' | 'unhealthy'
 
+// 代理出口 IP 信息（IPPure）
+export interface ProxyEgressInfo {
+  ip: string
+  asn?: number
+  asOrganization?: string
+  country?: string
+  countryCode?: string
+  region?: string
+  regionCode?: string
+  city?: string
+  timezone?: string
+  fraudScore?: number
+  isResidential?: boolean
+  isBroadcast?: boolean
+}
+
 // 代理池条目
 export interface ProxyPoolEntry {
   id: number
@@ -175,6 +191,7 @@ export interface ProxyPoolEntry {
   lastCheckedAt?: string
   consecutiveFailures: number
   autoDisabled: boolean
+  egress?: ProxyEgressInfo
 }
 
 // 代理池列表响应
@@ -183,19 +200,33 @@ export interface ProxyPoolResponse {
   proxies: ProxyPoolEntry[]
 }
 
+export type ProxyScheme = 'http' | 'https' | 'socks5' | 'socks5h' | 'socks4'
+
+/** 无协议简写导入格式 */
+export type ProxyImportFormat =
+  | 'auto'
+  | 'user_pass_host_port'
+  | 'host_port_user_pass'
+  | 'user_pass_at_host_port'
+  | 'host_port_at_user_pass'
+
 // 添加代理请求
 export interface AddProxyRequest {
   url: string
   label?: string
   /** 无协议简写时的默认协议 */
-  defaultScheme?: 'http' | 'https' | 'socks5' | 'socks4'
+  defaultScheme?: ProxyScheme
+  /** 无协议简写时的字段顺序 */
+  importFormat?: ProxyImportFormat
 }
 
 // 批量添加代理请求
 export interface BatchAddProxyRequest {
   urls: string[]
   /** 无协议简写时的默认协议 */
-  defaultScheme?: 'http' | 'https' | 'socks5' | 'socks4'
+  defaultScheme?: ProxyScheme
+  /** 无协议简写时的字段顺序 */
+  importFormat?: ProxyImportFormat
 }
 
 // 分配代理给凭据请求
@@ -219,6 +250,7 @@ export interface ProxyCheckResponse {
   lastCheckedAt?: string
   enabled: boolean
   autoDisabled: boolean
+  egress?: ProxyEgressInfo
 }
 
 // 全量健康检查响应

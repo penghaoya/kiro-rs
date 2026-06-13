@@ -225,8 +225,10 @@ fn validate_proxy_url(url: Option<&str>) -> Result<(), AdminServiceError> {
 fn normalize_proxy_input(
     url: &str,
     default_scheme: Option<&str>,
+    import_format: Option<&str>,
 ) -> Result<String, AdminServiceError> {
-    crate::proxy_url::normalize_proxy_url(url, default_scheme).map_err(|e| {
+    let format = crate::proxy_url::ProxyImportFormat::parse(import_format);
+    crate::proxy_url::normalize_proxy_url(url, default_scheme, format).map_err(|e| {
         AdminServiceError::InvalidCredential(e.to_string())
     })
 }
@@ -1241,7 +1243,7 @@ impl AdminService {
     pub fn set_global_proxy(&self, url: Option<String>) -> Result<(), AdminServiceError> {
         let url = match url {
             Some(u) if u.trim().is_empty() => None,
-            Some(u) => Some(normalize_proxy_input(&u, None)?),
+            Some(u) => Some(normalize_proxy_input(&u, None, None)?),
             None => None,
         };
         validate_proxy_url(url.as_deref())?;
@@ -2406,6 +2408,7 @@ impl AdminService {
                     last_checked_at: p.last_checked_at,
                     consecutive_failures: p.consecutive_failures,
                     auto_disabled: p.auto_disabled,
+                    egress: p.egress,
                 }
             })
             .collect();
@@ -2419,9 +2422,15 @@ impl AdminService {
     /// 添加代理到池中
     pub fn add_proxy(&self, req: AddProxyRequest) -> Result<ProxyPoolEntry, AdminServiceError> {
         let default_scheme = req.default_scheme.as_deref();
+        let import_format = req.import_format.as_deref();
         let entry = self
             .proxy_pool
-            .add(req.url, req.label, default_scheme)
+            .add(
+                req.url,
+                req.label,
+                default_scheme,
+                crate::proxy_url::ProxyImportFormat::parse(import_format),
+            )
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
         Ok(ProxyPoolEntry {
             id: entry.id,
@@ -2434,6 +2443,7 @@ impl AdminService {
             last_checked_at: entry.last_checked_at,
             consecutive_failures: entry.consecutive_failures,
             auto_disabled: entry.auto_disabled,
+            egress: entry.egress,
         })
     }
 
@@ -2443,7 +2453,10 @@ impl AdminService {
         req: BatchAddProxyRequest,
     ) -> (Vec<ProxyPoolEntry>, Vec<String>) {
         let default_scheme = req.default_scheme.as_deref();
-        let (added, errors) = self.proxy_pool.batch_add(req.urls, default_scheme);
+        let import_format = crate::proxy_url::ProxyImportFormat::parse(req.import_format.as_deref());
+        let (added, errors) = self
+            .proxy_pool
+            .batch_add(req.urls, default_scheme, import_format);
         let result = added
             .into_iter()
             .map(|e| ProxyPoolEntry {
@@ -2457,6 +2470,7 @@ impl AdminService {
                 last_checked_at: e.last_checked_at,
                 consecutive_failures: e.consecutive_failures,
                 auto_disabled: e.auto_disabled,
+                egress: e.egress,
             })
             .collect();
         (result, errors)
@@ -2538,6 +2552,7 @@ impl AdminService {
             last_checked_at: entry.last_checked_at,
             enabled: entry.enabled,
             auto_disabled: entry.auto_disabled,
+            egress: entry.egress,
         })
     }
 
