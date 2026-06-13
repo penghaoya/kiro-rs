@@ -44,6 +44,8 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess }: IdcLoginDialog
   // 对话框关闭时重置状态
   const handleOpenChange = (v: boolean) => {
     if (!v) {
+      // 发起登录请求进行中禁止关闭；waiting 为设备码轮询，允许中途放弃。
+      if (isStarting) return
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
       setStep('form')
       setSession(null)

@@ -6,6 +6,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
 import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, Globe } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
+import { ErrorBoundary } from "@/components/error-boundary";
 
 function GithubIcon({ className }: { className?: string }) {
   return (
@@ -85,6 +86,9 @@ function readTabFromHash(): Tab {
 function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [tab, setTab] = useState<Tab>(readTabFromHash);
+  // 记录已访问过的 Tab：首次访问才挂载，之后用 CSS 隐藏保活，
+  // 避免切走再切回丢失分页 / 筛选 / 选择等本地状态。
+  const [visited, setVisited] = useState<Set<Tab>>(() => new Set([readTabFromHash()]));
   const { darkMode, toggle: toggleDarkMode } = useDarkMode();
 
   useEffect(() => {
@@ -92,14 +96,26 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const onHash = () => setTab(readTabFromHash());
+    const onHash = () => {
+      const next = readTabFromHash();
+      setTab(next);
+      setVisited((prev) => (prev.has(next) ? prev : new Set(prev).add(next)));
+    };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  // 非法 hash（如 #/garbage）回退到概览时，同步纠正地址栏，避免刷新/收藏仍停在坏 hash。
+  useEffect(() => {
+    const raw = window.location.hash.replace(/^#\/?/, "");
+    if (raw !== tab) window.location.hash = `#/${tab}`;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const switchTab = (next: Tab) => {
     window.location.hash = `#/${next}`;
     setTab(next);
+    setVisited((prev) => (prev.has(next) ? prev : new Set(prev).add(next)));
   };
 
   const handleLogin = () => setIsLoggedIn(true);
@@ -198,19 +214,31 @@ function App() {
       </header>
 
       <main className="mx-auto max-w-[1400px] px-4 md:px-8 py-4">
-        <Suspense
-          fallback={
-            <div className="text-sm text-muted-foreground">加载中…</div>
-          }
-        >
-          {tab === "overview" && <OverviewPage />}
-          {tab === "credentials" && (
-            <Dashboard onLogout={handleLogout} embedded />
-          )}
-          {tab === "proxies" && <ProxyPoolPage />}
-          {tab === "keys" && <ClientKeysPage />}
-          {tab === "traces" && <TraceLogPage />}
-        </Suspense>
+        {TABS.map((t) => {
+          if (!visited.has(t.key)) return null;
+          const active = tab === t.key;
+          return (
+            <div key={t.key} hidden={!active} aria-hidden={!active}>
+              <ErrorBoundary>
+                <Suspense
+                  fallback={
+                    <div className="text-sm text-muted-foreground py-20 text-center">
+                      加载中…
+                    </div>
+                  }
+                >
+                  {t.key === "overview" && <OverviewPage />}
+                  {t.key === "credentials" && (
+                    <Dashboard onLogout={handleLogout} embedded />
+                  )}
+                  {t.key === "proxies" && <ProxyPoolPage />}
+                  {t.key === "keys" && <ClientKeysPage />}
+                  {t.key === "traces" && <TraceLogPage active={active} />}
+                </Suspense>
+              </ErrorBoundary>
+            </div>
+          );
+        })}
       </main>
 
       <Toaster position="top-center" />

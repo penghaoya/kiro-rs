@@ -69,6 +69,9 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
 
   const handleOpenChange = (v: boolean) => {
     if (!v) {
+      // 仅在发起/完成回调这两个网络请求进行中禁止关闭；
+      // waiting 步骤是等待用户在外部浏览器操作，允许中途放弃。
+      if (isStarting || isCompleting) return
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
       setStep('form')
       setSession(null)

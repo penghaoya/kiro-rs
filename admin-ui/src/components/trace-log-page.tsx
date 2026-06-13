@@ -10,6 +10,7 @@ import {
   CheckCircle2,
   Unplug,
   Settings2,
+  Copy,
 } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -110,6 +111,43 @@ function credLabel(id: number, email?: string | null): string {
   return email ? email : `#${id}`
 }
 
+async function copyText(text: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    toast.success(`${label}已复制`)
+  } catch {
+    toast.error('复制失败，请手动选择复制')
+  }
+}
+
+/** 小型复制按钮：用于 traceId / 错误信息等排障常复制的内容 */
+function CopyButton({
+  value,
+  label,
+  className,
+}: {
+  value: string
+  label: string
+  className?: string
+}) {
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation()
+        copyText(value, label)
+      }}
+      className={
+        className ??
+        'inline-flex items-center gap-1 rounded px-1 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground'
+      }
+      title={`复制${label}`}
+    >
+      <Copy className="h-3 w-3" />
+    </button>
+  )
+}
+
 const STATUS_OPTIONS = [
   { value: '', label: '全部状态' },
   { value: 'success', label: '成功' },
@@ -147,9 +185,16 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
         </span>
       </div>
       {a.errorSnippet && (
-        <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-all rounded-md bg-background/60 p-2 font-mono text-[11px] text-muted-foreground">
-          {a.errorSnippet}
-        </pre>
+        <div className="relative mt-2">
+          <pre className="max-h-28 overflow-auto whitespace-pre-wrap break-all rounded-md bg-background/60 p-2 pr-7 font-mono text-[11px] text-muted-foreground">
+            {a.errorSnippet}
+          </pre>
+          <CopyButton
+            value={a.errorSnippet}
+            label="错误信息"
+            className="absolute right-1 top-1 inline-flex items-center gap-1 rounded px-1 py-0.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          />
+        </div>
       )}
     </div>
   )
@@ -239,9 +284,19 @@ function TraceRow({
 function ExpandedDetail({ rec }: { rec: TraceRecord }) {
   return (
     <div className="space-y-3">
+      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+        <span className="shrink-0">Trace ID</span>
+        <code className="truncate font-mono text-foreground/80">{rec.traceId}</code>
+        <CopyButton value={rec.traceId} label="Trace ID" />
+      </div>
       {rec.errorMessage && (
-        <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-[13px] text-destructive">
+        <div className="relative rounded-lg border border-destructive/30 bg-destructive/5 p-3 pr-8 text-[13px] text-destructive">
           {rec.errorMessage}
+          <CopyButton
+            value={rec.errorMessage}
+            label="错误信息"
+            className="absolute right-1.5 top-1.5 inline-flex items-center gap-1 rounded px-1 py-0.5 text-destructive/70 transition-colors hover:bg-destructive/10 hover:text-destructive"
+          />
         </div>
       )}
       {rec.interruptedAfterBytes != null && (
@@ -499,7 +554,12 @@ function TracePaginationBar({
   )
 }
 
-export function TraceLogPage() {
+interface TraceLogPageProps {
+  /** Tab 是否处于激活态；隐藏时停掉轮询，避免后台 5s 打请求 */
+  active?: boolean
+}
+
+export function TraceLogPage({ active = true }: TraceLogPageProps) {
   const tableScrollRef = useRef<HTMLDivElement>(null)
   const [status, setStatus] = useState('')
   const [errorType, setErrorType] = useState('')
@@ -522,7 +582,10 @@ export function TraceLogPage() {
     limit: pageSize,
     offset: page * pageSize,
   }
-  const { data, isLoading, isFetching, refetch } = useTraces(query)
+  // 仅在「激活 + 停在第一页 + 未展开任何行」时轮询：
+  // offset 分页下新数据会插到 offset 0，翻历史页或读详情时轮询会让同页行错位。
+  const shouldPoll = active && page === 0 && expandedTraceId === null
+  const { data, isLoading, isFetching, refetch } = useTraces(query, true, shouldPoll)
   const records = data?.records ?? []
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
@@ -557,7 +620,7 @@ export function TraceLogPage() {
               )}
             </div>
             <p className="mt-0.5 text-sm text-muted-foreground">
-              查看每次 API 调用的重试链路与失败原因，每 5 秒自动刷新
+              查看每次 API 调用的重试链路与失败原因，停在首页时每 5 秒自动刷新
             </p>
           </div>
         </div>
@@ -650,7 +713,7 @@ export function TraceLogPage() {
                     <th className="py-2 pr-3 font-medium text-right">耗时</th>
                   </tr>
                 </thead>
-                <tbody className={isFetching ? 'opacity-60 transition-opacity' : undefined}>
+                <tbody>
                   {records.map((rec) => (
                     <TraceRow
                       key={rec.traceId}

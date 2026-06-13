@@ -471,10 +471,9 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
     <Dialog
       open={open}
       onOpenChange={(newOpen) => {
-        // 关闭时清空表单（但不在导入过程中清空）
-        if (!newOpen && !importing) {
-          resetForm()
-        }
+        // 导入进行中禁止关闭，避免 Esc/点遮罩中断循环、丢失已导入进度
+        if (!newOpen && importing) return
+        if (!newOpen) resetForm()
         onOpenChange(newOpen)
       }}
     >

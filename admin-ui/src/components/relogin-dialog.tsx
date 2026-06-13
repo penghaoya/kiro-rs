@@ -136,6 +136,9 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ['credentials'] })
 
   const handleClose = () => {
+    // 进行中禁止关闭：manual-updating 会先临时禁用凭据再更新，
+    // 中途关闭可能让凭据停在禁用态；isStarting/isCompleting 为在途网络请求。
+    if (isStarting || isCompleting || step === 'manual-updating') return
     if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
     setStep('select')
     setSocialSession(null)

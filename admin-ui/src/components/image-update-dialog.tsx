@@ -211,8 +211,18 @@ export function ImageUpdateDialog({ open, onOpenChange }: ImageUpdateDialogProps
     githubTokenMutation.isPending ||
     verifyTokenMutation.isPending
 
+  // 拉取/应用/回退会重启服务，进行中禁止关闭，避免中断升级流程
+  const criticalBusy =
+    pullMutation.isPending || applyMutation.isPending || rollbackMutation.isPending
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next && criticalBusy) return
+        onOpenChange(next)
+      }}
+    >
       <DialogContent
         aria-describedby={undefined}
         className="sm:max-w-2xl max-h-[85vh] overflow-y-auto"

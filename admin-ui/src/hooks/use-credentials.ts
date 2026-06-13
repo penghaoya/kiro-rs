@@ -27,6 +27,37 @@ import {
   resetAllSuccessCount,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateCredentialRequest, UpdateGlobalConfigRequest, UpdateRefreshTokenRequest } from '@/types/api'
+import type { CredentialsStatusResponse, CredentialStatusItem } from '@/types/api'
+
+const CREDENTIALS_KEY = ['credentials'] as const
+
+/**
+ * 乐观更新单个凭据：在缓存里就地改写 id 命中的那条，立刻反映到 UI，
+ * 避免等最长 30s 的整列表 refetch 造成开关回弹 / 整页闪烁。
+ * 返回回滚所需的旧快照（配合 onError 使用）。
+ */
+function optimisticPatchCredential(
+  queryClient: ReturnType<typeof useQueryClient>,
+  id: number,
+  patch: (c: CredentialStatusItem) => CredentialStatusItem,
+) {
+  const previous = queryClient.getQueryData<CredentialsStatusResponse>(CREDENTIALS_KEY)
+  if (previous) {
+    queryClient.setQueryData<CredentialsStatusResponse>(CREDENTIALS_KEY, {
+      ...previous,
+      credentials: previous.credentials.map((c) => (c.id === id ? patch(c) : c)),
+    })
+  }
+  return { previous }
+}
+
+/** 乐观更新的统一 onError 回滚：把列表缓存还原成 onMutate 时的快照。 */
+function rollbackCredentials(
+  queryClient: ReturnType<typeof useQueryClient>,
+  ctx: { previous?: CredentialsStatusResponse } | undefined,
+) {
+  if (ctx?.previous) queryClient.setQueryData(CREDENTIALS_KEY, ctx.previous)
+}
 
 // 查询凭据列表
 export function useCredentials() {
@@ -63,9 +94,12 @@ export function useSetDisabled() {
   return useMutation({
     mutationFn: ({ id, disabled }: { id: number; disabled: boolean }) =>
       setCredentialDisabled(id, disabled),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    onMutate: async ({ id, disabled }) => {
+      await queryClient.cancelQueries({ queryKey: CREDENTIALS_KEY })
+      return optimisticPatchCredential(queryClient, id, (c) => ({ ...c, disabled }))
     },
+    onError: (_e, _v, ctx) => rollbackCredentials(queryClient, ctx),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: CREDENTIALS_KEY }),
   })
 }
 
@@ -75,9 +109,12 @@ export function useSetPriority() {
   return useMutation({
     mutationFn: ({ id, priority }: { id: number; priority: number }) =>
       setCredentialPriority(id, priority),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    onMutate: async ({ id, priority }) => {
+      await queryClient.cancelQueries({ queryKey: CREDENTIALS_KEY })
+      return optimisticPatchCredential(queryClient, id, (c) => ({ ...c, priority }))
     },
+    onError: (_e, _v, ctx) => rollbackCredentials(queryClient, ctx),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: CREDENTIALS_KEY }),
   })
 }
 
@@ -87,8 +124,16 @@ export function useSetEndpoint() {
   return useMutation({
     mutationFn: ({ id, endpoint }: { id: number; endpoint: string | null }) =>
       setCredentialEndpoint(id, endpoint),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    onMutate: async ({ id, endpoint }) => {
+      await queryClient.cancelQueries({ queryKey: CREDENTIALS_KEY })
+      return optimisticPatchCredential(queryClient, id, (c) => ({
+        ...c,
+        configuredEndpoint: endpoint,
+      }))
+    },
+    onError: (_e, _v, ctx) => rollbackCredentials(queryClient, ctx),
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: CREDENTIALS_KEY })
       queryClient.invalidateQueries({ queryKey: ['globalConfig'] })
     },
   })
@@ -99,9 +144,12 @@ export function useResetFailure() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => resetCredentialFailure(id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    onMutate: async (id) => {
+      await queryClient.cancelQueries({ queryKey: CREDENTIALS_KEY })
+      return optimisticPatchCredential(queryClient, id, (c) => ({ ...c, failureCount: 0 }))
     },
+    onError: (_e, _v, ctx) => rollbackCredentials(queryClient, ctx),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: CREDENTIALS_KEY }),
   })
 }
 
@@ -121,9 +169,15 @@ export function useClearThrottle() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => clearThrottle(id),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    onMutate: async (id) => {
+      await queryClient.cancelQueries({ queryKey: CREDENTIALS_KEY })
+      return optimisticPatchCredential(queryClient, id, (c) => ({
+        ...c,
+        throttledRemainingSecs: 0,
+      }))
     },
+    onError: (_e, _v, ctx) => rollbackCredentials(queryClient, ctx),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: CREDENTIALS_KEY }),
   })
 }
 
